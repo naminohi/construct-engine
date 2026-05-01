@@ -221,6 +221,11 @@ pub enum PlatformAction {
     },
 
     // ── Network / Debug ───────────────────────────────────────────────────────
+    /// Transport connection state changed.
+    /// `connected: true` — H3 is live and ready.
+    /// `connected: false` — connection lost, engine is reconnecting.
+    ConnectionStateChanged { connected: bool },
+
     /// Unrecoverable network error. Swift should show the user a reconnecting UI.
     NetworkError { message: String },
 

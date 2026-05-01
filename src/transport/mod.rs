@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
 use http::Request;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tracing::{debug, error, info};
 
 use crate::{config::EngineConfig, error::EngineError};
@@ -55,17 +55,24 @@ pub struct Transport {
     h3: RwLock<Option<H3State>>,
     /// Current bearer token — set after successful auth.
     pub token: RwLock<Option<String>>,
+    /// Watch channel: `true` = H3 connected, `false` = driver closed.
+    /// Engine event loop subscribes to detect drops and trigger reconnect.
+    connected_tx: Arc<watch::Sender<bool>>,
+    pub connected_rx: watch::Receiver<bool>,
 }
 
 impl Transport {
     pub async fn new(config: Arc<EngineConfig>) -> Result<Self, EngineError> {
         let quic = QuicConnection::new(Arc::clone(&config)).await?;
         let initial_token = config.auth_token.clone();
+        let (connected_tx, connected_rx) = watch::channel(false);
         Ok(Self {
             config,
             quic: Arc::new(quic),
             h3: RwLock::new(None),
             token: RwLock::new(initial_token),
+            connected_tx: Arc::new(connected_tx),
+            connected_rx,
         })
     }
 
@@ -78,9 +85,12 @@ impl Transport {
             .await
             .map_err(|e| EngineError::transport(format!("h3 client init: {e}")))?;
 
+        // Notify watchers when the driver exits (connection lost).
+        let tx = Arc::clone(&self.connected_tx);
         let driver_handle = tokio::spawn(async move {
             let _closed = std::future::poll_fn(|cx| h3_driver.poll_close(cx)).await;
-            error!("H3 driver closed");
+            error!("H3 driver closed — signalling disconnect");
+            let _ = tx.send(false);
         });
 
         *self.h3.write().await = Some(H3State {
@@ -88,11 +98,13 @@ impl Transport {
             _driver: driver_handle,
         });
 
+        let _ = self.connected_tx.send(true);
         info!("H3 connection established");
         Ok(())
     }
 
-    /// Ensure a live H3 connection exists; connect if not.
+    /// Ensure a live H3 connection exists; connect once if not.
+    /// For retry-with-backoff use `ConstructEngine::ensure_connected()`.
     async fn ensure_h3(&self) -> Result<(), EngineError> {
         if self.h3.read().await.is_none() {
             self.connect_h3().await?;

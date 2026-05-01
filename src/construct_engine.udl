@@ -150,6 +150,7 @@ interface PlatformAction {
     CallSignalReceived(string call_id, bytes signal_bytes);
 
     // Network / Debug
+    ConnectionStateChanged(boolean connected);
     NetworkError(string message);
     Log(string level, string message);
 };

@@ -1,5 +1,6 @@
 use prost::Message;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -37,6 +38,15 @@ pub struct ConstructEngine {
     runtime: Mutex<Option<EngineRuntime>>,
     /// Live bidi stream handle (set when OpenMessageStream succeeds)
     stream: tokio::sync::Mutex<Option<BiDiStreamHandle>>,
+    /// Parameters of the last OpenMessageStream call — used to re-open after reconnect.
+    stream_params: tokio::sync::Mutex<Option<StreamParams>>,
+}
+
+/// Stored so the engine can re-subscribe after a reconnect.
+#[derive(Clone)]
+struct StreamParams {
+    conversation_ids: Vec<String>,
+    last_cursor: Option<String>,
 }
 
 impl ConstructEngine {
@@ -59,6 +69,7 @@ impl ConstructEngine {
             dispatch_tx: tx,
             runtime: Mutex::new(Some(EngineRuntime { rx, rt })),
             stream: tokio::sync::Mutex::new(None),
+            stream_params: tokio::sync::Mutex::new(None),
         }))
     }
 
@@ -106,12 +117,8 @@ impl ConstructEngine {
     // ── Internal ─────────────────────────────────────────────────────────────
 
     async fn event_loop(self: Arc<Self>, mut rx: mpsc::Receiver<UiEvent>) {
-        // Phase 1: initialise transport layer
         let transport = match Transport::new(Arc::clone(&self.config)).await {
-            Ok(t) => {
-                debug!("transport initialised");
-                Arc::new(t)
-            }
+            Ok(t) => Arc::new(t),
             Err(e) => {
                 error!("transport init failed: {e}");
                 self.callback.on_action(PlatformAction::NetworkError {
@@ -121,12 +128,74 @@ impl ConstructEngine {
             }
         };
 
+        // Initial connection attempt with backoff.
+        self.ensure_connected(&transport).await;
+
+        // Subscribe to H3 driver-close notifications.
+        let mut connected_rx = transport.connected_rx.clone();
+
         loop {
-            let Some(event) = rx.recv().await else {
-                // Channel closed — shutdown
-                break;
-            };
-            self.handle_event(&transport, event).await;
+            tokio::select! {
+                biased;
+
+                // ── Disconnect detected ─────────────────────────────────────
+                Ok(_) = connected_rx.changed() => {
+                    if !*connected_rx.borrow() {
+                        warn!("H3 driver closed — starting reconnect");
+                        self.callback.on_action(PlatformAction::ConnectionStateChanged {
+                            connected: false,
+                        });
+                        // Drop stale stream handle (pump task will have exited anyway).
+                        *self.stream.lock().await = None;
+
+                        self.ensure_connected(&transport).await;
+
+                        // Re-open MessageStream if the app had one subscribed.
+                        if let Some(params) = self.stream_params.lock().await.clone() {
+                            self.handle_open_stream(&transport, params.conversation_ids, params.last_cursor).await;
+                        }
+                    }
+                }
+
+                // ── Normal UI event ─────────────────────────────────────────
+                event = rx.recv() => {
+                    let Some(event) = event else { break };
+                    self.handle_event(&transport, event).await;
+                }
+            }
+        }
+
+        info!("event loop exited");
+    }
+
+    /// Connect to the server with exponential backoff.
+    ///
+    /// Delays: 1 s → 2 s → 4 s → 8 s → … → 60 s (cap).
+    /// Fires `NetworkError` on each failed attempt and
+    /// `ConnectionStateChanged { connected: true }` on success.
+    async fn ensure_connected(&self, transport: &Transport) {
+        const MAX_DELAY: Duration = Duration::from_secs(60);
+        let mut delay = Duration::from_secs(1);
+
+        loop {
+            match transport.connect_h3().await {
+                Ok(_) => {
+                    self.callback
+                        .on_action(PlatformAction::ConnectionStateChanged { connected: true });
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "connection attempt failed ({e}), retry in {}s",
+                        delay.as_secs()
+                    );
+                    self.callback.on_action(PlatformAction::NetworkError {
+                        message: format!("Reconnecting in {}s… ({})", delay.as_secs(), e),
+                    });
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MAX_DELAY);
+                }
+            }
         }
     }
 
@@ -403,6 +472,14 @@ impl ConstructEngine {
         conversations: Vec<String>,
         cursor: Option<String>,
     ) {
+        info!("open_stream: conversations={}", conversations.len());
+
+        // Persist params so reconnect can resubscribe automatically.
+        *self.stream_params.lock().await = Some(StreamParams {
+            conversation_ids: conversations.clone(),
+            last_cursor: cursor.clone(),
+        });
+
         let cb = Arc::clone(&self.callback);
         let result = transport
             .open_message_stream(conversations, cursor, move |frame| {
