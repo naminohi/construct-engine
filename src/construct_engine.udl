@@ -1,0 +1,155 @@
+// ============================================================================
+// construct-engine UniFFI interface
+//
+// Post-modern transport engine for Construct Messenger.
+// QUIC/HTTP3/gRPC + E2EE (construct-core).
+//
+// Swift side:
+//   let engine = try ConstructEngine(config: config, callback: adapter)
+//   try engine.start()
+//   engine.dispatch(event: .openMessageStream(...))
+// ============================================================================
+
+namespace construct_engine {};
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+[Error]
+interface EngineError {
+    Transport(string message);
+    Tls(string message);
+    Grpc(u32 code, string message);
+    Crypto(string message);
+    Config(string message);
+    AlreadyRunning();
+    NotRunning();
+    Timeout();
+    Internal(string message);
+};
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+dictionary EngineConfig {
+    string server_host;
+    u16 server_port;
+    boolean verify_certs;
+    boolean use_masque;
+    string? masque_host;
+    u16? masque_port;
+    u64 event_buffer;
+};
+
+// ============================================================================
+// Callback (Swift → implemented, Rust → calls back)
+// ============================================================================
+
+callback interface EngineCallback {
+    void on_action(PlatformAction action);
+};
+
+// ============================================================================
+// Main engine object
+// ============================================================================
+
+interface ConstructEngine {
+    /// Create the engine. Does not start networking yet.
+    [Throws=EngineError]
+    constructor(EngineConfig config, EngineCallback callback);
+
+    /// Start the engine (non-blocking). Spawns internal tokio runtime.
+    /// Networking begins after `PlatformReady` event is dispatched.
+    [Throws=EngineError]
+    void start();
+
+    /// Dispatch a UI event to the engine (non-blocking, sync).
+    void dispatch(UiEvent event);
+
+    /// Graceful shutdown. Waits up to 5s for in-flight sends.
+    void shutdown();
+};
+
+// ============================================================================
+// UiEvent — Swift → Rust events
+// ============================================================================
+
+[Enum]
+interface UiEvent {
+    // Auth
+    Authenticate(string device_id, bytes challenge_response, bytes signing_key);
+    RefreshToken(string refresh_token);
+    Logout();
+
+    // Keys
+    FetchPreKeyBundle(string user_id, string? device_id);
+    UploadPreKeys(string device_id, bytes request_bytes);
+    GetPreKeyCount(string device_id);
+    RotateSignedPreKey(string device_id, bytes request_bytes);
+
+    // Messaging
+    OpenMessageStream(sequence<string> conversation_ids, string? since_cursor);
+    CloseMessageStream();
+    SendMessage(string contact_id, bytes encrypted_payload, string local_id, string conversation_id);
+    AckMessage(string message_id, u64 message_number);
+
+    // Session
+    InitSessionInitiator(string contact_id);
+
+    // Users
+    SearchUser(string query);
+
+    // Signaling
+    Signal(string call_id, bytes signal_bytes);
+
+    // Push
+    RegisterPushToken(string token, string platform);
+
+    // Platform responses
+    KeychainResult(string key, bytes? data);
+    PlatformReady();
+};
+
+// ============================================================================
+// PlatformAction — Rust → Swift callbacks
+// ============================================================================
+
+[Enum]
+interface PlatformAction {
+    // Keychain
+    SaveKeychain(string key, bytes data);
+    LoadKeychain(string key);
+    DeleteKeychain(string key);
+
+    // Auth
+    SetAuthToken(string access_token, string refresh_token, i64 expires_at);
+    ClearAuth();
+
+    // Messaging
+    SaveMessage(bytes envelope_bytes, string sender_id, string conversation_id, i64 timestamp);
+    UpdateMessageStatus(string local_id, u8 status);
+    DisplayMessage(bytes plaintext, string sender_id, string conversation_id, i64 timestamp);
+    DeliveryReceipt(string message_id, string conversation_id, i64 timestamp);
+
+    // Session
+    SessionEstablished(string contact_id, string session_id);
+    SessionError(string contact_id, string message);
+
+    // Keys
+    PreKeyBundleReady(string user_id, bytes bundle_bytes);
+    PreKeyCountUpdated(u32 count, u32 recommended_minimum);
+
+    // Stream
+    StreamReady(string? stream_cursor);
+    StreamError(string message);
+
+    // Calls
+    IncomingCall(string call_id, string caller_id, bytes signal_bytes);
+    CallSignalReceived(string call_id, bytes signal_bytes);
+
+    // Network / Debug
+    NetworkError(string message);
+    Log(string level, string message);
+};
