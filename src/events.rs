@@ -43,10 +43,7 @@ pub enum UiEvent {
     /// Generate `count` new one-time pre-keys from OrchestratorCore and upload
     /// them to KeyService. Engine persists the updated orchestrator state via
     /// `SaveKeychain` before making the RPC, then fires `OtpksUploaded`.
-    UploadOtpks {
-        device_id: String,
-        count: u32,
-    },
+    UploadOtpks { device_id: String, count: u32 },
 
     /// Check how many one-time pre-keys remain on the server.
     /// Engine auto-uploads if the count is below `recommended_minimum`.
@@ -154,10 +151,7 @@ pub enum PlatformAction {
 
     /// Device successfully registered. Swift should store the user ID and
     /// transition from the registration screen to the main UI.
-    RegistrationComplete {
-        user_id: String,
-        device_id: String,
-    },
+    RegistrationComplete { user_id: String, device_id: String },
 
     // ── Messaging ────────────────────────────────────────────────────────────
     /// Persist a received message envelope for display in the chat.

@@ -11,8 +11,8 @@ use crate::{
     events::{PlatformAction, UiEvent},
     proto::services::v1 as pb,
     transport::{
-        AUTH_AUTHENTICATE, AUTH_LOGOUT, AUTH_POW_CHALLENGE, AUTH_REFRESH, AUTH_REGISTER,
-        KEY_COUNT, KEY_GET_BUNDLE, KEY_ROTATE_SPK, KEY_UPLOAD, NOTIFICATION_REGISTER, USER_FIND,
+        AUTH_AUTHENTICATE, AUTH_LOGOUT, AUTH_POW_CHALLENGE, AUTH_REFRESH, AUTH_REGISTER, KEY_COUNT,
+        KEY_GET_BUNDLE, KEY_ROTATE_SPK, KEY_UPLOAD, NOTIFICATION_REGISTER, USER_FIND,
     },
     transport::{BiDiStreamHandle, Transport},
 };
@@ -149,9 +149,10 @@ impl ConstructEngine {
 
     /// Update the stored token refresh state. Called by every auth handler on success.
     fn set_token_state(&self, refresh_token: String, expires_at: i64) {
-        let _ = self
-            .token_state
-            .send(Some(TokenRefreshState { refresh_token, expires_at }));
+        let _ = self.token_state.send(Some(TokenRefreshState {
+            refresh_token,
+            expires_at,
+        }));
     }
 
     /// Clear token state on logout or unrecoverable auth error.
@@ -208,9 +209,9 @@ impl ConstructEngine {
                 let state = token_rx.borrow_and_update().clone();
                 if let Some(ts) = state {
                     let secs_until_refresh = Self::secs_until_refresh(ts.expires_at);
-                    refresh_sleep
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + Duration::from_secs(secs_until_refresh));
+                    refresh_sleep.as_mut().reset(
+                        tokio::time::Instant::now() + Duration::from_secs(secs_until_refresh),
+                    );
                     refresh_armed = true;
                     info!("token refresh scheduled in {secs_until_refresh}s");
                 } else {
@@ -317,7 +318,10 @@ impl ConstructEngine {
                 info!("platform ready — engine fully operational");
             }
 
-            UiEvent::RegisterDevice { username, device_id } => {
+            UiEvent::RegisterDevice {
+                username,
+                device_id,
+            } => {
                 self.handle_register_device(transport, username, device_id)
                     .await;
             }
@@ -393,7 +397,8 @@ impl ConstructEngine {
             }
 
             UiEvent::InitSessionInitiator { contact_id } => {
-                self.handle_init_session(transport, contact_id).await;
+                self.handle_init_session_initiator(transport, contact_id)
+                    .await;
             }
 
             UiEvent::SearchUser { query } => {
@@ -456,7 +461,10 @@ impl ConstructEngine {
 
         // ── Step 1: fetch PoW challenge ───────────────────────────────────────
         let challenge_bytes = match transport
-            .unary_call(AUTH_POW_CHALLENGE, &pb::GetPowChallengeRequest {}.encode_to_vec())
+            .unary_call(
+                AUTH_POW_CHALLENGE,
+                &pb::GetPowChallengeRequest {}.encode_to_vec(),
+            )
             .await
         {
             Ok(b) => b,
@@ -496,7 +504,9 @@ impl ConstructEngine {
             let guard = self.core.lock().expect("core mutex poisoned");
             match guard.as_ref() {
                 None => {
-                    error!("register_device: OrchestratorCore not initialised — dispatch KeychainResult first");
+                    error!(
+                        "register_device: OrchestratorCore not initialised — dispatch KeychainResult first"
+                    );
                     return;
                 }
                 Some(core_arc) => {
@@ -615,7 +625,11 @@ impl ConstructEngine {
         }
     }
 
-    async fn handle_refresh_token(self: &Arc<Self>, transport: &Arc<Transport>, refresh_token: String) {
+    async fn handle_refresh_token(
+        self: &Arc<Self>,
+        transport: &Arc<Transport>,
+        refresh_token: String,
+    ) {
         let device_id = transport.config.my_device_id.clone();
         let req = pb::RefreshTokenRequest {
             refresh_token,
@@ -772,7 +786,9 @@ impl ConstructEngine {
         transport: &Arc<Transport>,
         device_id: String,
     ) {
-        let req = pb::GetPreKeyCountRequest { device_id: device_id.clone() };
+        let req = pb::GetPreKeyCountRequest {
+            device_id: device_id.clone(),
+        };
         match transport.unary_call(KEY_COUNT, &req.encode_to_vec()).await {
             Ok(bytes) => match pb::GetPreKeyCountResponse::decode(bytes.as_slice()) {
                 Ok(resp) => {
@@ -845,11 +861,15 @@ impl ConstructEngine {
             reason: pb::SignedPreKeyRotationReason::Scheduled as i32,
             new_kyber_signed_pre_key: None,
         };
-        match transport.unary_call(KEY_ROTATE_SPK, &req.encode_to_vec()).await {
+        match transport
+            .unary_call(KEY_ROTATE_SPK, &req.encode_to_vec())
+            .await
+        {
             Ok(bytes) => match pb::RotateSignedPreKeyResponse::decode(bytes.as_slice()) {
                 Ok(resp) if resp.success => {
                     info!("RotateSignedPreKey succeeded: new_key_id={key_id}");
-                    self.callback.on_action(PlatformAction::SpkRotated { key_id });
+                    self.callback
+                        .on_action(PlatformAction::SpkRotated { key_id });
                 }
                 Ok(_) => error!("RotateSignedPreKey: server returned success=false"),
                 Err(e) => error!("RotateSignedPreKey decode error: {e}"),
@@ -977,9 +997,182 @@ impl ConstructEngine {
         }
     }
 
-    async fn handle_init_session(&self, _t: &Transport, contact_id: String) {
+    async fn handle_init_session_initiator(
+        self: &Arc<Self>,
+        transport: &Arc<Transport>,
+        contact_id: String,
+    ) {
+        use crate::proto::core::v1 as pb_core;
+        use construct_core::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+        use construct_core::crypto::suite_id::SuiteID;
+
         info!("init_session_initiator: contact_id={contact_id}");
-        // Phase 2: fetch bundle then call OrchestratorCore::init_session
+
+        // ── 1. Fetch pre-key bundle from KeyService ──────────────────────────
+        let req = pb::GetPreKeyBundleRequest {
+            user_id: contact_id.clone(),
+            device_id: None,
+            preferred_suite: None,
+        };
+        let resp_bytes = match transport
+            .unary_call(KEY_GET_BUNDLE, &req.encode_to_vec())
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                error!("init_session_initiator: GetPreKeyBundle failed: {e}");
+                self.callback.on_action(PlatformAction::SessionError {
+                    contact_id,
+                    message: format!("Bundle fetch failed: {e}"),
+                });
+                return;
+            }
+        };
+        let resp = match pb::GetPreKeyBundleResponse::decode(resp_bytes.as_slice()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("init_session_initiator: decode error: {e}");
+                self.callback.on_action(PlatformAction::SessionError {
+                    contact_id,
+                    message: format!("Bundle decode error: {e}"),
+                });
+                return;
+            }
+        };
+        let bundle = match resp.bundle {
+            Some(b) => b,
+            None => {
+                error!("init_session_initiator: server returned no bundle for {contact_id}");
+                self.callback.on_action(PlatformAction::SessionError {
+                    contact_id,
+                    message: "Server returned no pre-key bundle".to_string(),
+                });
+                return;
+            }
+        };
+
+        // ── 2. Map proto CryptoSuite → construct-core SuiteID ────────────────
+        let suite_id = {
+            let cs = bundle.crypto_suite;
+            if cs == pb_core::CryptoSuite::HybridKyber1024X25519 as i32
+                || cs == pb_core::CryptoSuite::HybridKyber768X25519 as i32
+            {
+                SuiteID::PQ_HYBRID
+            } else {
+                SuiteID::CLASSIC
+            }
+        };
+
+        // ── 3. Build X3DHPublicKeyBundle ──────────────────────────────────────
+        let x3dh_bundle = X3DHPublicKeyBundle {
+            identity_public: bundle.identity_key.to_vec(),
+            signed_prekey_public: bundle.signed_pre_key.to_vec(),
+            signature: bundle.signed_pre_key_signature.to_vec(),
+            verifying_key: resp.verifying_key.to_vec(),
+            suite_id,
+            one_time_prekey_public: bundle.one_time_pre_key.map(|b| b.to_vec()),
+            one_time_prekey_id: bundle.one_time_pre_key_id,
+            spk_uploaded_at: bundle.spk_uploaded_at as u64,
+            spk_rotation_epoch: bundle.spk_rotation_epoch,
+            kyber_spk_uploaded_at: bundle.kyber_spk_uploaded_at.unwrap_or(0) as u64,
+            kyber_spk_rotation_epoch: bundle.kyber_spk_rotation_epoch.unwrap_or(0),
+        };
+        let kyber_pre_key = bundle.kyber_pre_key.map(|b| b.to_vec());
+        let kyber_otpk = bundle.kyber_one_time_pre_key.map(|b| b.to_vec());
+        let kyber_otpk_id = bundle.kyber_one_time_pre_key_id;
+
+        // ── 4. Init session + encrypt msgNum=0 ping + export state ────────────
+        // All sync ops under the same core lock; drop before any await.
+        // Wrapped in a closure so `?` can propagate inside a `() -> Result<_,_>` scope.
+        let result: Result<(Vec<u8>, Vec<u8>), String> = (|| {
+            let guard = self.core.lock().expect("core mutex poisoned");
+            match guard.as_ref() {
+                None => Err("OrchestratorCore not initialized".to_string()),
+                Some(core) => {
+                    let mut orc = core.lock().expect("inner core mutex poisoned");
+
+                    // X3DH key agreement → Double Ratchet init
+                    orc.init_session_with_bundle(
+                        &contact_id,
+                        x3dh_bundle,
+                        kyber_pre_key,
+                        kyber_otpk,
+                        kyber_otpk_id,
+                    )
+                    .map_err(|e| format!("init_session_with_bundle: {e}"))?;
+
+                    // Encrypt session-init ping (empty, msgNum=0) → packed WirePayload
+                    let wire_payload = orc
+                        .encrypt_bytes_for(&contact_id, &[])
+                        .map_err(|e| format!("encrypt first message: {e}"))?;
+
+                    // Export state AFTER encrypt (includes DR advancement for msgNum=0)
+                    let state_bytes = orc.export_orchestrator_state_cfe().unwrap_or_default();
+
+                    Ok((wire_payload, state_bytes))
+                }
+            }
+        })();
+
+        let (wire_payload, state_bytes) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                error!("init_session_initiator: {e}");
+                self.callback.on_action(PlatformAction::SessionError {
+                    contact_id,
+                    message: e,
+                });
+                return;
+            }
+        };
+
+        // ── 5. Persist state before transmitting (crash-safety) ───────────────
+        if !state_bytes.is_empty() {
+            self.callback.on_action(PlatformAction::SaveKeychain {
+                key: "orchestrator_state".to_string(),
+                data: state_bytes,
+            });
+        }
+
+        // ── 6. Send session-init WirePayload over the MessageStream ───────────
+        let local_id = uuid::Uuid::new_v4().to_string();
+        let envelope = crate::proto::core::v1::Envelope {
+            // For DMs, conversation_id is the contact's user_id by convention.
+            conversation_id: contact_id.clone(),
+            encrypted_payload: wire_payload.into(),
+            message_id_type: Some(crate::proto::core::v1::envelope::MessageIdType::MessageId(
+                local_id.clone(),
+            )),
+            ..Default::default()
+        };
+        let stream_req = pb::MessageStreamRequest {
+            request: Some(pb::message_stream_request::Request::Send(envelope)),
+            request_id: local_id.clone(),
+            attempt_id: Some(local_id.clone()),
+        };
+        let frame = crate::transport::grpc::encode_grpc_frame(&stream_req.encode_to_vec());
+
+        {
+            let stream_guard = self.stream.lock().await;
+            if let Some(stream) = stream_guard.as_ref() {
+                if let Err(e) = stream.send_frame(frame).await {
+                    warn!("init_session_initiator: stream send failed: {e}");
+                }
+            } else {
+                warn!(
+                    "init_session_initiator: no active stream — session init will be sent when stream opens"
+                );
+                // TODO(ce-p3): enqueue for retry on StreamReady
+            }
+        }
+
+        // ── 7. Notify platform ────────────────────────────────────────────────
+        self.callback.on_action(PlatformAction::SessionEstablished {
+            contact_id: contact_id.clone(),
+            session_id: local_id,
+        });
+
+        info!("init_session_initiator: session established with {contact_id}");
     }
 
     async fn handle_search_user(&self, transport: &Transport, query: String) {
