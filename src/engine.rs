@@ -344,24 +344,16 @@ impl ConstructEngine {
                     .await;
             }
 
-            UiEvent::UploadPreKeys {
-                device_id,
-                request_bytes,
-            } => {
-                self.handle_upload_pre_keys(transport, device_id, request_bytes)
-                    .await;
+            UiEvent::UploadOtpks { device_id, count } => {
+                self.handle_upload_otpks(transport, device_id, count).await;
             }
 
             UiEvent::GetPreKeyCount { device_id } => {
                 self.handle_get_pre_key_count(transport, device_id).await;
             }
 
-            UiEvent::RotateSignedPreKey {
-                device_id,
-                request_bytes,
-            } => {
-                self.handle_rotate_spk(transport, device_id, request_bytes)
-                    .await;
+            UiEvent::RotateSignedPreKey { device_id } => {
+                self.handle_rotate_spk(transport, device_id).await;
             }
 
             UiEvent::OpenMessageStream {
@@ -556,9 +548,12 @@ impl ConstructEngine {
                         self.callback
                             .on_action(PlatformAction::RegistrationComplete {
                                 user_id,
-                                device_id,
+                                device_id: device_id.clone(),
                             });
                         self.reopen_stream_if_needed(transport).await;
+                        // After first registration, upload an initial OTPK batch.
+                        let dev = transport.config.my_device_id.clone();
+                        self.handle_get_pre_key_count(transport, dev).await;
                     } else {
                         error!("RegisterDevice: server returned empty tokens");
                     }
@@ -606,6 +601,9 @@ impl ConstructEngine {
                         });
                         // Re-open stream if it was active before re-auth.
                         self.reopen_stream_if_needed(transport).await;
+                        // Check + replenish OTPKs autonomously after successful auth.
+                        let device_id = transport.config.my_device_id.clone();
+                        self.handle_get_pre_key_count(transport, device_id).await;
                     }
                 }
                 Err(e) => error!("AuthenticateDevice decode error: {e}"),
@@ -692,22 +690,89 @@ impl ConstructEngine {
         }
     }
 
-    async fn handle_upload_pre_keys(
-        &self,
-        transport: &Transport,
+    /// Generate `count` OTPKs from OrchestratorCore, persist the new state,
+    /// upload to KeyService, and fire `OtpksUploaded`.
+    async fn handle_upload_otpks(
+        self: &Arc<Self>,
+        transport: &Arc<Transport>,
         device_id: String,
-        request_bytes: Vec<u8>,
+        count: u32,
     ) {
-        info!("upload_pre_keys: device_id={device_id}");
-        // request_bytes is already a serialised UploadPreKeysRequest proto.
-        match transport.unary_call(KEY_UPLOAD, &request_bytes).await {
-            Ok(_) => info!("UploadPreKeys succeeded"),
-            Err(e) => error!("UploadPreKeys failed: {e}"),
+        info!("upload_otpks: device_id={device_id} count={count}");
+
+        // ── Generate OTPKs and export new state (sync — release before await) ─
+        let (pre_keys, state_bytes) = {
+            let guard = self.core.lock().expect("core mutex poisoned");
+            match guard.as_ref() {
+                None => {
+                    error!("upload_otpks: OrchestratorCore not initialised");
+                    return;
+                }
+                Some(core_arc) => {
+                    let mut orch = core_arc.lock().expect("orchestrator mutex poisoned");
+                    let pairs = match orch.generate_otpks(count) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!("generate_otpks failed: {e}");
+                            return;
+                        }
+                    };
+                    let state = match orch.export_orchestrator_state_cfe() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("export_orchestrator_state_cfe failed: {e}");
+                            return;
+                        }
+                    };
+                    let keys: Vec<pb::OneTimePreKey> = pairs
+                        .into_iter()
+                        .map(|(key_id, public_key)| pb::OneTimePreKey {
+                            key_id,
+                            public_key: public_key.into(),
+                        })
+                        .collect();
+                    (keys, state)
+                }
+            }
+        };
+
+        // Persist updated orchestrator state before uploading to prevent
+        // key loss if the RPC succeeds but the app crashes before the next save.
+        self.callback.on_action(PlatformAction::SaveKeychain {
+            key: "orchestrator_state".to_string(),
+            data: state_bytes,
+        });
+
+        let uploaded = pre_keys.len() as u32;
+        let req = pb::UploadPreKeysRequest {
+            device_id,
+            pre_keys,
+            signed_pre_key: None,
+            replace_existing: false,
+            kyber_pre_keys: vec![],
+            kyber_signed_pre_key: None,
+        };
+        match transport.unary_call(KEY_UPLOAD, &req.encode_to_vec()).await {
+            Ok(bytes) => match pb::UploadPreKeysResponse::decode(bytes.as_slice()) {
+                Ok(resp) => {
+                    info!("UploadOtpks: server_count={}", resp.pre_key_count);
+                    self.callback.on_action(PlatformAction::OtpksUploaded {
+                        uploaded,
+                        server_count: resp.pre_key_count,
+                    });
+                }
+                Err(e) => error!("UploadPreKeys decode error: {e}"),
+            },
+            Err(e) => error!("UploadOtpks failed: {e}"),
         }
     }
 
-    async fn handle_get_pre_key_count(&self, transport: &Transport, device_id: String) {
-        let req = pb::GetPreKeyCountRequest { device_id };
+    async fn handle_get_pre_key_count(
+        self: &Arc<Self>,
+        transport: &Arc<Transport>,
+        device_id: String,
+    ) {
+        let req = pb::GetPreKeyCountRequest { device_id: device_id.clone() };
         match transport.unary_call(KEY_COUNT, &req.encode_to_vec()).await {
             Ok(bytes) => match pb::GetPreKeyCountResponse::decode(bytes.as_slice()) {
                 Ok(resp) => {
@@ -715,6 +780,15 @@ impl ConstructEngine {
                         count: resp.count,
                         recommended_minimum: resp.recommended_minimum,
                     });
+                    // Auto-replenish if below the server-recommended minimum.
+                    if resp.count < resp.recommended_minimum {
+                        let needed = resp.recommended_minimum.saturating_sub(resp.count);
+                        info!(
+                            "otpk_count ({}) below minimum ({}) — uploading {needed}",
+                            resp.count, resp.recommended_minimum
+                        );
+                        self.handle_upload_otpks(transport, device_id, needed).await;
+                    }
                 }
                 Err(e) => error!("GetPreKeyCount decode error: {e}"),
             },
@@ -722,16 +796,64 @@ impl ConstructEngine {
         }
     }
 
-    async fn handle_rotate_spk(
-        &self,
-        transport: &Transport,
-        device_id: String,
-        request_bytes: Vec<u8>,
-    ) {
+    /// Rotate the signed pre-key via OrchestratorCore, persist state, upload to server.
+    async fn handle_rotate_spk(&self, transport: &Transport, device_id: String) {
         info!("rotate_spk: device_id={device_id}");
-        // request_bytes is a serialised RotateSignedPreKeyRequest proto.
-        match transport.unary_call(KEY_ROTATE_SPK, &request_bytes).await {
-            Ok(_) => info!("RotateSignedPreKey succeeded"),
+
+        // ── Rotate SPK and export new state (sync — release before await) ────
+        let (key_id, spk_public, spk_sig, state_bytes) = {
+            let guard = self.core.lock().expect("core mutex poisoned");
+            match guard.as_ref() {
+                None => {
+                    error!("rotate_spk: OrchestratorCore not initialised");
+                    return;
+                }
+                Some(core_arc) => {
+                    let mut orch = core_arc.lock().expect("orchestrator mutex poisoned");
+                    let (kid, pub_key, sig) = match orch.rotate_spk() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("rotate_spk failed: {e}");
+                            return;
+                        }
+                    };
+                    let state = match orch.export_orchestrator_state_cfe() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("export_orchestrator_state_cfe after rotate_spk: {e}");
+                            return;
+                        }
+                    };
+                    (kid, pub_key, sig, state)
+                }
+            }
+        };
+
+        // Persist before the RPC for the same crash-safety reason as OTPKs.
+        self.callback.on_action(PlatformAction::SaveKeychain {
+            key: "orchestrator_state".to_string(),
+            data: state_bytes,
+        });
+
+        let req = pb::RotateSignedPreKeyRequest {
+            device_id,
+            new_signed_pre_key: Some(pb::SignedPreKeyUpload {
+                key_id,
+                public_key: spk_public.into(),
+                signature: spk_sig.into(),
+            }),
+            reason: pb::SignedPreKeyRotationReason::Scheduled as i32,
+            new_kyber_signed_pre_key: None,
+        };
+        match transport.unary_call(KEY_ROTATE_SPK, &req.encode_to_vec()).await {
+            Ok(bytes) => match pb::RotateSignedPreKeyResponse::decode(bytes.as_slice()) {
+                Ok(resp) if resp.success => {
+                    info!("RotateSignedPreKey succeeded: new_key_id={key_id}");
+                    self.callback.on_action(PlatformAction::SpkRotated { key_id });
+                }
+                Ok(_) => error!("RotateSignedPreKey: server returned success=false"),
+                Err(e) => error!("RotateSignedPreKey decode error: {e}"),
+            },
             Err(e) => error!("RotateSignedPreKey failed: {e}"),
         }
     }

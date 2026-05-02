@@ -92,9 +92,9 @@ interface UiEvent {
 
     // Keys
     FetchPreKeyBundle(string user_id, string? device_id);
-    UploadPreKeys(string device_id, bytes request_bytes);
+    UploadOtpks(string device_id, u32 count);
     GetPreKeyCount(string device_id);
-    RotateSignedPreKey(string device_id, bytes request_bytes);
+    RotateSignedPreKey(string device_id);
 
     // Messaging
     OpenMessageStream(sequence<string> conversation_ids, string? since_cursor);
@@ -147,7 +147,9 @@ interface PlatformAction {
 
     // Keys
     PreKeyBundleReady(string user_id, bytes bundle_bytes);
+    OtpksUploaded(u32 uploaded, u32 server_count);
     PreKeyCountUpdated(u32 count, u32 recommended_minimum);
+    SpkRotated(u32 key_id);
 
     // Stream
     StreamReady(string? stream_cursor);

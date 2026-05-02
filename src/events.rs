@@ -40,22 +40,21 @@ pub enum UiEvent {
         device_id: Option<String>,
     },
 
-    /// Upload a batch of one-time pre-keys to the server.
-    UploadPreKeys {
+    /// Generate `count` new one-time pre-keys from OrchestratorCore and upload
+    /// them to KeyService. Engine persists the updated orchestrator state via
+    /// `SaveKeychain` before making the RPC, then fires `OtpksUploaded`.
+    UploadOtpks {
         device_id: String,
-        /// Serialised `UploadPreKeysRequest` proto bytes
-        request_bytes: Vec<u8>,
+        count: u32,
     },
 
     /// Check how many one-time pre-keys remain on the server.
+    /// Engine auto-uploads if the count is below `recommended_minimum`.
     GetPreKeyCount { device_id: String },
 
-    /// Rotate the signed pre-key.
-    RotateSignedPreKey {
-        device_id: String,
-        /// Serialised `RotateSignedPreKeyRequest` proto bytes
-        request_bytes: Vec<u8>,
-    },
+    /// Rotate the signed pre-key. Engine calls `Orchestrator::rotate_spk()`,
+    /// persists the new state, and fires `SpkRotated` on success.
+    RotateSignedPreKey { device_id: String },
 
     // ── Messaging ────────────────────────────────────────────────────────────
     /// Open the bidirectional `MessageStream` gRPC call.
@@ -209,10 +208,24 @@ pub enum PlatformAction {
         bundle_bytes: Vec<u8>,
     },
 
+    /// One-time pre-keys were successfully uploaded to the server.
+    OtpksUploaded {
+        /// Number of keys uploaded in this batch.
+        uploaded: u32,
+        /// Total server-side OTPK count after upload.
+        server_count: u32,
+    },
+
     /// Current one-time pre-key count from the server.
     PreKeyCountUpdated {
         count: u32,
         recommended_minimum: u32,
+    },
+
+    /// Signed pre-key was rotated. Swift should update UI indicators if shown.
+    SpkRotated {
+        /// New key ID assigned by the Orchestrator.
+        key_id: u32,
     },
 
     // ── Stream ────────────────────────────────────────────────────────────────
