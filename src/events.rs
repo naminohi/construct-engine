@@ -177,8 +177,9 @@ pub enum PlatformAction {
     UpdateMessageStatus { local_id: String, status: u8 },
 
     /// A decrypted message is ready to display. Swift should persist
-    /// and render it. `plaintext` is raw KNST protobuf bytes.
+    /// and render it. `plaintext` is the raw decrypted payload bytes (UTF-8 text or JSON).
     DisplayMessage {
+        message_id: String,
         plaintext: Vec<u8>,
         sender_id: String,
         conversation_id: String,

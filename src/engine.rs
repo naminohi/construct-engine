@@ -1426,6 +1426,7 @@ impl ConstructEngine {
                     match result {
                         Ok(plaintext) => {
                             self.callback.on_action(PlatformAction::DisplayMessage {
+                                message_id: message_id.clone(),
                                 plaintext: plaintext.clone(),
                                 sender_id: sender_id.clone(),
                                 conversation_id: conversation_id.clone(),
@@ -1863,6 +1864,7 @@ impl ConstructEngine {
         // Surface plaintext only if the init ping contained actual content.
         if !plaintext.is_empty() {
             self.callback.on_action(PlatformAction::DisplayMessage {
+                message_id: message_id.clone(),
                 plaintext,
                 sender_id: sender_id.clone(),
                 conversation_id,
@@ -1919,6 +1921,7 @@ impl ConstructEngine {
         self.send_ack_frame(&message_id).await;
 
         self.callback.on_action(PlatformAction::DisplayMessage {
+            message_id,
             plaintext,
             sender_id,
             conversation_id,

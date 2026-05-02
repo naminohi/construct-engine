@@ -142,7 +142,7 @@ interface PlatformAction {
     // Messaging
     SaveMessage(bytes envelope_bytes, string sender_id, string conversation_id, i64 timestamp);
     UpdateMessageStatus(string local_id, u8 status);
-    DisplayMessage(bytes plaintext, string sender_id, string conversation_id, i64 timestamp);
+    DisplayMessage(string message_id, bytes plaintext, string sender_id, string conversation_id, i64 timestamp);
     DeliveryReceipt(string message_id, string conversation_id, i64 timestamp);
 
     // Session
