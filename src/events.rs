@@ -6,6 +6,17 @@
 #[derive(Debug)]
 pub enum UiEvent {
     // ── Auth ─────────────────────────────────────────────────────────────────
+    /// Register a new device. Engine fetches a PoW challenge, solves it, and
+    /// calls `AuthService/RegisterDevice`. On success fires `SetAuthToken` +
+    /// `RegistrationComplete`. The `OrchestratorCore` must already be initialised
+    /// (i.e. `keys_cfe_data` supplied at construction or via `KeychainResult`).
+    RegisterDevice {
+        /// Optional display name for the new identity (may be empty).
+        username: Option<String>,
+        /// Client-assigned device ID derived from the signing key fingerprint.
+        device_id: String,
+    },
+
     /// Authenticate an existing device. Called on app launch after Keychain load.
     Authenticate {
         device_id: String,
@@ -131,6 +142,8 @@ pub enum PlatformAction {
     // ── Auth ─────────────────────────────────────────────────────────────────
     /// Store new auth tokens (access + refresh) received from the server.
     SetAuthToken {
+        /// Present after `RegisterDevice`; empty string for re-auth / token refresh.
+        user_id: String,
         access_token: String,
         refresh_token: String,
         /// Unix timestamp (seconds) when the access token expires
@@ -139,6 +152,13 @@ pub enum PlatformAction {
 
     /// Clear all auth state (on logout or unauthenticated error).
     ClearAuth,
+
+    /// Device successfully registered. Swift should store the user ID and
+    /// transition from the registration screen to the main UI.
+    RegistrationComplete {
+        user_id: String,
+        device_id: String,
+    },
 
     // ── Messaging ────────────────────────────────────────────────────────────
     /// Persist a received message envelope for display in the chat.

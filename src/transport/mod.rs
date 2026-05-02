@@ -17,6 +17,8 @@ use self::grpc::{GrpcStatus, decode_grpc_frame, encode_grpc_frame};
 
 // ── gRPC service paths ───────────────────────────────────────────────────────
 
+pub const AUTH_POW_CHALLENGE: &str = "/shared.proto.services.v1.AuthService/GetPowChallenge";
+pub const AUTH_REGISTER: &str = "/shared.proto.services.v1.AuthService/RegisterDevice";
 pub const AUTH_AUTHENTICATE: &str = "/shared.proto.services.v1.AuthService/AuthenticateDevice";
 pub const AUTH_REFRESH: &str = "/shared.proto.services.v1.AuthService/RefreshToken";
 pub const AUTH_LOGOUT: &str = "/shared.proto.services.v1.AuthService/Logout";

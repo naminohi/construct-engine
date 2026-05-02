@@ -11,8 +11,8 @@ use crate::{
     events::{PlatformAction, UiEvent},
     proto::services::v1 as pb,
     transport::{
-        AUTH_AUTHENTICATE, AUTH_LOGOUT, AUTH_REFRESH, KEY_COUNT, KEY_GET_BUNDLE, KEY_ROTATE_SPK,
-        KEY_UPLOAD, NOTIFICATION_REGISTER, USER_FIND,
+        AUTH_AUTHENTICATE, AUTH_LOGOUT, AUTH_POW_CHALLENGE, AUTH_REFRESH, AUTH_REGISTER,
+        KEY_COUNT, KEY_GET_BUNDLE, KEY_ROTATE_SPK, KEY_UPLOAD, NOTIFICATION_REGISTER, USER_FIND,
     },
     transport::{BiDiStreamHandle, Transport},
 };
@@ -239,6 +239,11 @@ impl ConstructEngine {
                 info!("platform ready — engine fully operational");
             }
 
+            UiEvent::RegisterDevice { username, device_id } => {
+                self.handle_register_device(transport, username, device_id)
+                    .await;
+            }
+
             UiEvent::Authenticate {
                 device_id,
                 challenge_response,
@@ -354,9 +359,143 @@ impl ConstructEngine {
 
     // ── Handlers ──────────────────────────────────────────────────────────────
 
+    /// Re-opens the MessageStream if `stream_params` is stored (used after auth/refresh).
+    async fn reopen_stream_if_needed(self: &Arc<Self>, transport: &Arc<Transport>) {
+        let params = self.stream_params.lock().await.clone();
+        if let Some(p) = params {
+            info!("reopen_stream: re-subscribing after auth");
+            self.handle_open_stream(transport, p.conversation_ids, p.last_cursor)
+                .await;
+        }
+    }
+
+    /// Full registration flow:
+    /// 1. GetPowChallenge (unary)
+    /// 2. Solve PoW in a blocking thread (Argon2id, CPU-intensive)
+    /// 3. Extract public keys from the initialised OrchestratorCore
+    /// 4. RegisterDevice (unary)
+    /// 5. Fire SetAuthToken + RegistrationComplete callbacks
+    /// 6. Re-open MessageStream if stream_params are stored
+    async fn handle_register_device(
+        self: &Arc<Self>,
+        transport: &Arc<Transport>,
+        username: Option<String>,
+        device_id: String,
+    ) {
+        info!("register_device: device_id={device_id}");
+
+        // ── Step 1: fetch PoW challenge ───────────────────────────────────────
+        let challenge_bytes = match transport
+            .unary_call(AUTH_POW_CHALLENGE, &pb::GetPowChallengeRequest {}.encode_to_vec())
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                error!("GetPowChallenge failed: {e}");
+                return;
+            }
+        };
+        let challenge_resp = match pb::GetPowChallengeResponse::decode(challenge_bytes.as_slice()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("GetPowChallenge decode error: {e}");
+                return;
+            }
+        };
+        let challenge_str = challenge_resp.challenge.clone();
+        let difficulty = challenge_resp.difficulty;
+        info!("pow_challenge: difficulty={difficulty}");
+
+        // ── Step 2: solve PoW in a blocking thread (Argon2id — CPU-intensive) ─
+        let challenge_for_pow = challenge_str.clone();
+        let pow_solution = match tokio::task::spawn_blocking(move || {
+            construct_core::pow::compute_pow(&challenge_for_pow, difficulty)
+        })
+        .await
+        {
+            Ok(sol) => sol,
+            Err(e) => {
+                error!("PoW computation panicked: {e}");
+                return;
+            }
+        };
+        info!("pow_solved: nonce={}", pow_solution.nonce);
+
+        // ── Step 3: extract public keys from OrchestratorCore ─────────────────
+        let public_keys = {
+            let guard = self.core.lock().expect("core mutex poisoned");
+            match guard.as_ref() {
+                None => {
+                    error!("register_device: OrchestratorCore not initialised — dispatch KeychainResult first");
+                    return;
+                }
+                Some(core_arc) => {
+                    let orch = core_arc.lock().expect("orchestrator mutex poisoned");
+                    match orch.get_registration_bundle_fields() {
+                        Ok(bundle) => pb::DevicePublicKeys {
+                            verifying_key: bundle.verifying_key.into(),
+                            identity_public: bundle.identity_public.into(),
+                            signed_prekey_public: bundle.signed_prekey_public.into(),
+                            signed_prekey_signature: bundle.signature.into(),
+                            crypto_suite: "Curve25519+Ed25519".to_string(),
+                        },
+                        Err(e) => {
+                            error!("get_registration_bundle_fields failed: {e}");
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── Step 4: RegisterDevice RPC ────────────────────────────────────────
+        let req = pb::RegisterDeviceRequest {
+            username,
+            device_id: device_id.clone(),
+            public_keys: Some(public_keys),
+            pow_solution: Some(pb::PowSolution {
+                challenge: challenge_str,
+                nonce: pow_solution.nonce,
+                hash: pow_solution.hash,
+            }),
+        };
+        match transport
+            .unary_call(AUTH_REGISTER, &req.encode_to_vec())
+            .await
+        {
+            Ok(bytes) => match pb::RegisterDeviceResponse::decode(bytes.as_slice()) {
+                Ok(resp) => {
+                    if let Some(tokens) = resp.tokens {
+                        let user_id = tokens.user_id.clone();
+                        *transport.token.write().await = Some(tokens.access_token.clone());
+                        self.callback.on_action(PlatformAction::SetAuthToken {
+                            user_id: user_id.clone(),
+                            access_token: tokens.access_token,
+                            refresh_token: tokens.refresh_token,
+                            expires_at: tokens.expires_at,
+                        });
+                        self.callback
+                            .on_action(PlatformAction::RegistrationComplete {
+                                user_id,
+                                device_id,
+                            });
+                        self.reopen_stream_if_needed(transport).await;
+                    } else {
+                        error!("RegisterDevice: server returned empty tokens");
+                    }
+                }
+                Err(e) => error!("RegisterDevice decode error: {e}"),
+            },
+            Err(EngineError::Unauthenticated { .. }) => {
+                self.callback.on_action(PlatformAction::ClearAuth);
+            }
+            Err(e) => error!("RegisterDevice failed: {e}"),
+        }
+    }
+
     async fn handle_authenticate(
-        &self,
-        transport: &Transport,
+        self: &Arc<Self>,
+        transport: &Arc<Transport>,
         device_id: String,
         challenge_response: Vec<u8>,
         _signing_key: Vec<u8>,
@@ -380,10 +519,13 @@ impl ConstructEngine {
                         // Store token in transport for subsequent calls.
                         *transport.token.write().await = Some(tokens.access_token.clone());
                         self.callback.on_action(PlatformAction::SetAuthToken {
+                            user_id: tokens.user_id,
                             access_token: tokens.access_token,
                             refresh_token: tokens.refresh_token,
                             expires_at: tokens.expires_at,
                         });
+                        // Re-open stream if it was active before re-auth.
+                        self.reopen_stream_if_needed(transport).await;
                     }
                 }
                 Err(e) => error!("AuthenticateDevice decode error: {e}"),
@@ -395,7 +537,7 @@ impl ConstructEngine {
         }
     }
 
-    async fn handle_refresh_token(&self, transport: &Transport, refresh_token: String) {
+    async fn handle_refresh_token(self: &Arc<Self>, transport: &Arc<Transport>, refresh_token: String) {
         let device_id = transport.config.my_device_id.clone();
         let req = pb::RefreshTokenRequest {
             refresh_token,
@@ -409,10 +551,12 @@ impl ConstructEngine {
                 Ok(resp) => {
                     *transport.token.write().await = Some(resp.access_token.clone());
                     self.callback.on_action(PlatformAction::SetAuthToken {
+                        user_id: String::new(),
                         access_token: resp.access_token,
                         refresh_token: resp.refresh_token.unwrap_or_default(),
                         expires_at: resp.expires_at,
                     });
+                    self.reopen_stream_if_needed(transport).await;
                 }
                 Err(e) => error!("RefreshToken decode error: {e}"),
             },

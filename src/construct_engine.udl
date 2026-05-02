@@ -85,6 +85,7 @@ interface ConstructEngine {
 [Enum]
 interface UiEvent {
     // Auth
+    RegisterDevice(string? username, string device_id);
     Authenticate(string device_id, bytes challenge_response, bytes signing_key);
     RefreshToken(string refresh_token);
     Logout();
@@ -130,8 +131,9 @@ interface PlatformAction {
     DeleteKeychain(string key);
 
     // Auth
-    SetAuthToken(string access_token, string refresh_token, i64 expires_at);
+    SetAuthToken(string user_id, string access_token, string refresh_token, i64 expires_at);
     ClearAuth();
+    RegistrationComplete(string user_id, string device_id);
 
     // Messaging
     SaveMessage(bytes envelope_bytes, string sender_id, string conversation_id, i64 timestamp);
