@@ -439,6 +439,12 @@ impl ConstructEngine {
                 self.handle_register_push(transport, token, platform).await;
             }
 
+            UiEvent::BackgroundPush { since_cursor } => {
+                Arc::clone(self)
+                    .handle_background_push(transport, since_cursor)
+                    .await;
+            }
+
             UiEvent::KeychainResult { key, data } => {
                 debug!("keychain result: key={key} present={}", data.is_some());
                 if key == "private_keys" {
@@ -1303,6 +1309,186 @@ impl ConstructEngine {
             Ok(_) => info!("push token registered"),
             Err(e) => warn!("RegisterDeviceToken failed: {e}"),
         }
+    }
+
+    // ── Background push / offline batch decrypt ───────────────────────────────
+
+    /// Fetch and decrypt all pending messages after a silent APNs push.
+    ///
+    /// Paginates through `GetPendingMessages` until `has_more == false`, decrypts
+    /// each message via OrchestratorCore, fires `DisplayMessage` + `ShowNotification`
+    /// per message, exports state once after the batch, and fires
+    /// `BackgroundFetchComplete` so Swift can call the APNs completion handler.
+    async fn handle_background_push(
+        self: Arc<Self>,
+        transport: &Arc<Transport>,
+        since_cursor: Option<String>,
+    ) {
+        use crate::proto::core::v1::ContentType;
+        use crate::proto::services::v1::{GetPendingMessagesRequest, GetPendingMessagesResponse};
+        use crate::transport::MESSAGING_GET_PENDING;
+
+        info!("background_push: fetching pending messages");
+
+        let mut cursor = since_cursor;
+        let mut decrypted_count: u32 = 0;
+        let mut had_errors = false;
+
+        // Paginate until the server says there are no more messages.
+        loop {
+            let req = GetPendingMessagesRequest {
+                since_cursor: cursor.clone(),
+                limit: Some(50),
+            };
+            let resp_bytes = match transport
+                .unary_call(MESSAGING_GET_PENDING, &req.encode_to_vec())
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("background_push: GetPendingMessages failed: {e}");
+                    had_errors = true;
+                    break;
+                }
+            };
+            let resp = match GetPendingMessagesResponse::decode(resp_bytes.as_slice()) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("background_push: decode error: {e}");
+                    had_errors = true;
+                    break;
+                }
+            };
+
+            let has_more = resp.has_more;
+            cursor = if resp.next_cursor.is_empty() {
+                None
+            } else {
+                Some(resp.next_cursor.clone())
+            };
+
+            for msg in resp.messages {
+                // Only decrypt E2EE_SIGNAL messages — skip control types.
+                let ct = msg.content_type;
+                if ct != ContentType::E2eeSignal as i32 && ct != 0 {
+                    debug!("background_push: skipping content_type={ct}");
+                    continue;
+                }
+
+                let wire_payload = msg.encrypted_payload.to_vec();
+                if wire_payload.is_empty() {
+                    continue;
+                }
+
+                let sender_id = msg.sender_id.clone();
+                let message_id = msg.message_id.clone();
+                let timestamp = msg.timestamp;
+                let conversation_id = sender_id.clone(); // DM convention
+
+                // Peek message number without decrypting.
+                let message_number = match construct_core::wire_payload::unpack(&wire_payload) {
+                    Ok(d) => d.message_number,
+                    Err(e) => {
+                        warn!("background_push: wire_payload unpack for {sender_id}: {e:?}");
+                        had_errors = true;
+                        continue;
+                    }
+                };
+
+                if message_number == 0 {
+                    // Session init — run full RESPONDER path (async, does its own notifications).
+                    Arc::clone(&self)
+                        .handle_session_init_responder(
+                            transport,
+                            sender_id.clone(),
+                            wire_payload,
+                            message_id.clone(),
+                            conversation_id.clone(),
+                            timestamp,
+                        )
+                        .await;
+                    // handle_session_init_responder fires its own DisplayMessage + SessionEstablished
+                    decrypted_count += 1;
+                } else {
+                    // Normal decrypt.
+                    let result: Result<Vec<u8>, String> = (|| {
+                        let guard = self.core.lock().expect("core mutex poisoned");
+                        match guard.as_ref() {
+                            None => Err("OrchestratorCore not initialized".to_string()),
+                            Some(core) => {
+                                let mut orc = core.lock().expect("inner core mutex poisoned");
+                                orc.decrypt_bytes_for(&sender_id, &wire_payload)
+                                    .map_err(|e| format!("decrypt: {e}"))
+                            }
+                        }
+                    })();
+
+                    match result {
+                        Ok(plaintext) => {
+                            self.callback.on_action(PlatformAction::DisplayMessage {
+                                plaintext: plaintext.clone(),
+                                sender_id: sender_id.clone(),
+                                conversation_id: conversation_id.clone(),
+                                timestamp,
+                            });
+                            // Surface a notification preview (first 64 bytes of plaintext).
+                            let preview = if plaintext.is_empty() {
+                                None
+                            } else {
+                                Some(plaintext[..plaintext.len().min(64)].to_vec())
+                            };
+                            self.callback.on_action(PlatformAction::ShowNotification {
+                                message_id: message_id.clone(),
+                                sender_id: sender_id.clone(),
+                                conversation_id,
+                                preview,
+                                timestamp,
+                            });
+                            decrypted_count += 1;
+                        }
+                        Err(e) => {
+                            warn!("background_push: decrypt failed for {sender_id}: {e}");
+                            had_errors = true;
+                        }
+                    }
+                }
+            }
+
+            if !has_more {
+                break;
+            }
+        }
+
+        // Export state once after the entire batch (all DR ratchets advanced).
+        let state_export_result: Result<Vec<u8>, String> = (|| {
+            let guard = self.core.lock().expect("core mutex poisoned");
+            match guard.as_ref() {
+                None => Err("OrchestratorCore not initialized".to_string()),
+                Some(core) => {
+                    let orc = core.lock().expect("inner core mutex poisoned");
+                    orc.export_orchestrator_state_cfe()
+                        .map_err(|e| format!("export: {e}"))
+                }
+            }
+        })();
+
+        if let Ok(state_bytes) = state_export_result {
+            if !state_bytes.is_empty() {
+                self.callback.on_action(PlatformAction::SaveKeychain {
+                    key: "orchestrator_state".to_string(),
+                    data: state_bytes,
+                });
+            }
+        }
+
+        info!(
+            "background_push: done — decrypted={decrypted_count} errors={had_errors}"
+        );
+        self.callback
+            .on_action(PlatformAction::BackgroundFetchComplete {
+                decrypted_count,
+                had_errors,
+            });
     }
 
     // ── Incoming stream frame routing ─────────────────────────────────────────

@@ -109,6 +109,14 @@ pub enum UiEvent {
         platform: String,
     },
 
+    /// iOS received a silent APNs push — fetch and decrypt pending messages.
+    /// Engine calls `GetPendingMessages`, decrypts via OrchestratorCore, then
+    /// fires `DisplayMessage` + `ShowNotification` for each message.
+    BackgroundPush {
+        /// Last cursor from the previous stream/push session (for gapless fetch)
+        since_cursor: Option<String>,
+    },
+
     // ── Platform responses ────────────────────────────────────────────────────
     /// Swift Keychain read result delivered back to the engine.
     /// `data` is None if the key was not found.
@@ -259,4 +267,24 @@ pub enum PlatformAction {
 
     /// Debug log line (level: "DEBUG"|"INFO"|"WARN"|"ERROR").
     Log { level: String, message: String },
+
+    // ── Background push ───────────────────────────────────────────────────────
+    /// Show a local notification for a message received while the app was
+    /// backgrounded. Swift should post a `UNUserNotificationCenter` alert.
+    ShowNotification {
+        message_id: String,
+        sender_id: String,
+        conversation_id: String,
+        /// Optional decrypted preview (empty = "New message" fallback)
+        preview: Option<Vec<u8>>,
+        timestamp: i64,
+    },
+
+    /// Background fetch complete — Swift should call the APNs completion handler.
+    BackgroundFetchComplete {
+        /// Number of messages successfully decrypted
+        decrypted_count: u32,
+        /// Whether any errors occurred
+        had_errors: bool,
+    },
 }
