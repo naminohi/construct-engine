@@ -44,6 +44,9 @@ pub struct ConstructEngine {
     /// Crypto orchestrator — None on fresh install, set after key registration.
     /// Always use `core_locked()` accessor; never hold across `.await`.
     core: Mutex<Option<CoreHandle>>,
+    /// Current token refresh state: (refresh_token, expires_at_unix_secs).
+    /// Written by auth handlers; read by the event loop to schedule auto-refresh.
+    token_state: tokio::sync::watch::Sender<Option<TokenRefreshState>>,
 }
 
 /// Stored so the engine can re-subscribe after a reconnect.
@@ -51,6 +54,14 @@ pub struct ConstructEngine {
 struct StreamParams {
     conversation_ids: Vec<String>,
     last_cursor: Option<String>,
+}
+
+/// Current token state persisted in the engine for auto-refresh scheduling.
+#[derive(Clone, Debug)]
+struct TokenRefreshState {
+    refresh_token: String,
+    /// Unix timestamp (seconds) when the access token expires.
+    expires_at: i64,
 }
 
 impl ConstructEngine {
@@ -72,6 +83,8 @@ impl ConstructEngine {
             .build()
             .map_err(|e| EngineError::internal(format!("tokio runtime: {e}")))?;
 
+        let (token_tx, _) = tokio::sync::watch::channel(None::<TokenRefreshState>);
+
         Ok(Arc::new(Self {
             config: Arc::new(config),
             callback: Arc::from(callback),
@@ -80,6 +93,7 @@ impl ConstructEngine {
             stream: tokio::sync::Mutex::new(None),
             stream_params: tokio::sync::Mutex::new(None),
             core: Mutex::new(core),
+            token_state: token_tx,
         }))
     }
 
@@ -133,6 +147,18 @@ impl ConstructEngine {
         self.core.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    /// Update the stored token refresh state. Called by every auth handler on success.
+    fn set_token_state(&self, refresh_token: String, expires_at: i64) {
+        let _ = self
+            .token_state
+            .send(Some(TokenRefreshState { refresh_token, expires_at }));
+    }
+
+    /// Clear token state on logout or unrecoverable auth error.
+    fn clear_token_state(&self) {
+        let _ = self.token_state.send(None);
+    }
+
     /// Dispatch a UI event to the engine (sync, non-blocking).
     pub fn dispatch(&self, event: UiEvent) {
         if let Err(e) = self.dispatch_tx.try_send(event) {
@@ -166,10 +192,46 @@ impl ConstructEngine {
 
         // Subscribe to H3 driver-close notifications.
         let mut connected_rx = transport.connected_rx.clone();
+        // Subscribe to token state changes to schedule auto-refresh.
+        let mut token_rx = self.token_state.subscribe();
+
+        // Pinned sleep future for the token refresh timer.
+        // Initially set far in the future; reset when a token arrives.
+        // The `refresh_armed` guard prevents spurious fires while disabled.
+        let refresh_sleep = tokio::time::sleep(Duration::from_secs(86_400 * 365));
+        tokio::pin!(refresh_sleep);
+        let mut refresh_armed = false;
 
         loop {
+            // ── Update refresh timer if token state changed ─────────────────
+            if token_rx.has_changed().unwrap_or(false) {
+                let state = token_rx.borrow_and_update().clone();
+                if let Some(ts) = state {
+                    let secs_until_refresh = Self::secs_until_refresh(ts.expires_at);
+                    refresh_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + Duration::from_secs(secs_until_refresh));
+                    refresh_armed = true;
+                    info!("token refresh scheduled in {secs_until_refresh}s");
+                } else {
+                    refresh_armed = false;
+                }
+            }
+
             tokio::select! {
                 biased;
+
+                // ── Token refresh timer ─────────────────────────────────────
+                _ = &mut refresh_sleep, if refresh_armed => {
+                    refresh_armed = false;
+                    let state = self.token_state.borrow().clone();
+                    if let Some(ts) = state {
+                        info!("auto-refresh: requesting new token");
+                        Arc::clone(&self)
+                            .handle_refresh_token(&transport, ts.refresh_token)
+                            .await;
+                    }
+                }
 
                 // ── Disconnect detected ─────────────────────────────────────
                 Ok(_) = connected_rx.changed() => {
@@ -195,10 +257,26 @@ impl ConstructEngine {
                     let Some(event) = event else { break };
                     self.handle_event(&transport, event).await;
                 }
+
+                // ── Token state changed (wake select to recompute timer) ────
+                Ok(_) = token_rx.changed() => {
+                    // Loop again; the timer update block above will recompute.
+                }
             }
         }
 
         info!("event loop exited");
+    }
+
+    /// Seconds until token refresh: 5 minutes before expiry, minimum 10 seconds.
+    fn secs_until_refresh(expires_at: i64) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let secs_remaining = expires_at - now;
+        // Refresh 5 min early; never schedule less than 10 s out to avoid tight loops.
+        ((secs_remaining - 300).max(10)) as u64
     }
 
     /// Connect to the server with exponential backoff.
@@ -468,6 +546,7 @@ impl ConstructEngine {
                     if let Some(tokens) = resp.tokens {
                         let user_id = tokens.user_id.clone();
                         *transport.token.write().await = Some(tokens.access_token.clone());
+                        self.set_token_state(tokens.refresh_token.clone(), tokens.expires_at);
                         self.callback.on_action(PlatformAction::SetAuthToken {
                             user_id: user_id.clone(),
                             access_token: tokens.access_token,
@@ -518,6 +597,7 @@ impl ConstructEngine {
                     if let Some(tokens) = resp.tokens {
                         // Store token in transport for subsequent calls.
                         *transport.token.write().await = Some(tokens.access_token.clone());
+                        self.set_token_state(tokens.refresh_token.clone(), tokens.expires_at);
                         self.callback.on_action(PlatformAction::SetAuthToken {
                             user_id: tokens.user_id,
                             access_token: tokens.access_token,
@@ -549,11 +629,13 @@ impl ConstructEngine {
         {
             Ok(bytes) => match pb::RefreshTokenResponse::decode(bytes.as_slice()) {
                 Ok(resp) => {
+                    let rt = resp.refresh_token.unwrap_or_default();
                     *transport.token.write().await = Some(resp.access_token.clone());
+                    self.set_token_state(rt.clone(), resp.expires_at);
                     self.callback.on_action(PlatformAction::SetAuthToken {
                         user_id: String::new(),
                         access_token: resp.access_token,
-                        refresh_token: resp.refresh_token.unwrap_or_default(),
+                        refresh_token: rt,
                         expires_at: resp.expires_at,
                     });
                     self.reopen_stream_if_needed(transport).await;
@@ -561,6 +643,7 @@ impl ConstructEngine {
                 Err(e) => error!("RefreshToken decode error: {e}"),
             },
             Err(EngineError::Unauthenticated { .. }) => {
+                self.clear_token_state();
                 self.callback.on_action(PlatformAction::ClearAuth);
             }
             Err(e) => error!("RefreshToken failed: {e}"),
@@ -579,6 +662,7 @@ impl ConstructEngine {
             warn!("Logout RPC failed (continuing anyway): {e}");
         }
         *transport.token.write().await = None;
+        self.clear_token_state();
         self.callback.on_action(PlatformAction::ClearAuth);
     }
 
