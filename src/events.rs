@@ -66,11 +66,12 @@ pub enum UiEvent {
     /// Close the bidirectional stream (graceful half-close).
     CloseMessageStream,
 
-    /// Send a message. Engine enqueues into the open MessageStream.
+    /// Send a message. Engine encrypts via OrchestratorCore then enqueues into
+    /// the open MessageStream. Fires `UpdateMessageStatus` on send/failure.
     SendMessage {
         contact_id: String,
-        /// Sealed-box ciphertext (binary, no base64)
-        encrypted_payload: Vec<u8>,
+        /// Raw plaintext bytes (engine encrypts internally via Double Ratchet)
+        plaintext: Vec<u8>,
         /// Client-assigned UUID for correlation
         local_id: String,
         conversation_id: String,

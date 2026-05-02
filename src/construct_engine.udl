@@ -99,7 +99,7 @@ interface UiEvent {
     // Messaging
     OpenMessageStream(sequence<string> conversation_ids, string? since_cursor);
     CloseMessageStream();
-    SendMessage(string contact_id, bytes encrypted_payload, string local_id, string conversation_id);
+    SendMessage(string contact_id, bytes plaintext, string local_id, string conversation_id);
     AckMessage(string message_id, u64 message_number);
 
     // Session

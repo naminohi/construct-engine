@@ -392,14 +392,14 @@ impl ConstructEngine {
 
             UiEvent::SendMessage {
                 contact_id,
-                encrypted_payload,
+                plaintext,
                 local_id,
                 conversation_id,
             } => {
                 self.handle_send_message(
                     transport,
                     contact_id,
-                    encrypted_payload,
+                    plaintext,
                     local_id,
                     conversation_id,
                 )
@@ -945,7 +945,7 @@ impl ConstructEngine {
         &self,
         _t: &Transport,
         contact_id: String,
-        encrypted_payload: Vec<u8>,
+        plaintext: Vec<u8>,
         local_id: String,
         conversation_id: String,
     ) {
@@ -953,9 +953,49 @@ impl ConstructEngine {
         use crate::proto::services::v1::{MessageStreamRequest, message_stream_request};
 
         debug!("send_message: to={contact_id} local_id={local_id}");
+
+        // ── 1. Encrypt via Double Ratchet + export state ──────────────────────
+        let result: Result<(Vec<u8>, Vec<u8>), String> = (|| {
+            let guard = self.core.lock().expect("core mutex poisoned");
+            match guard.as_ref() {
+                None => Err("OrchestratorCore not initialized".to_string()),
+                Some(core) => {
+                    let mut orc = core.lock().expect("inner core mutex poisoned");
+                    let wire_payload = orc
+                        .encrypt_bytes_for(&contact_id, &plaintext)
+                        .map_err(|e| format!("encrypt: {e}"))?;
+                    let state_bytes = orc
+                        .export_orchestrator_state_cfe()
+                        .unwrap_or_default();
+                    Ok((wire_payload, state_bytes))
+                }
+            }
+        })();
+
+        let (wire_payload, state_bytes) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("send_message encrypt failed: {e}");
+                self.callback.on_action(PlatformAction::UpdateMessageStatus {
+                    local_id,
+                    status: 4, // FAILED
+                });
+                return;
+            }
+        };
+
+        // ── 2. Persist state BEFORE sending (crash-safety) ───────────────────
+        if !state_bytes.is_empty() {
+            self.callback.on_action(PlatformAction::SaveKeychain {
+                key: "orchestrator_state".to_string(),
+                data: state_bytes,
+            });
+        }
+
+        // ── 3. Build Envelope + wrap in MessageStreamRequest ─────────────────
         let envelope = Envelope {
             conversation_id: conversation_id.clone(),
-            encrypted_payload: encrypted_payload.into(),
+            encrypted_payload: wire_payload.into(),
             message_id_type: Some(crate::proto::core::v1::envelope::MessageIdType::MessageId(
                 local_id.clone(),
             )),
@@ -968,13 +1008,29 @@ impl ConstructEngine {
         };
         let frame = crate::transport::grpc::encode_grpc_frame(&req.encode_to_vec());
 
+        // ── 4. Enqueue over the stream ────────────────────────────────────────
         let guard = self.stream.lock().await;
         if let Some(stream) = guard.as_ref() {
             if let Err(e) = stream.send_frame(frame).await {
                 warn!("send_message enqueue failed: {e}");
+                drop(guard);
+                self.callback.on_action(PlatformAction::UpdateMessageStatus {
+                    local_id,
+                    status: 4, // FAILED
+                });
+            } else {
+                self.callback.on_action(PlatformAction::UpdateMessageStatus {
+                    local_id,
+                    status: 1, // SENT
+                });
             }
         } else {
             warn!("send_message: no active stream — message dropped (local_id={local_id})");
+            drop(guard);
+            self.callback.on_action(PlatformAction::UpdateMessageStatus {
+                local_id,
+                status: 4, // FAILED
+            });
         }
     }
 
