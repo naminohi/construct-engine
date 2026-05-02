@@ -109,6 +109,11 @@ impl ConstructEngine {
     /// Start the engine. Non-blocking — spawns background threads.
     /// Must be called exactly once before `dispatch()`.
     pub fn start(self: &Arc<Self>) -> Result<(), EngineError> {
+        // rustls 0.23+ requires an explicit default CryptoProvider before any TLS
+        // operation. Install ring (matches Cargo.toml features = ["ring"]).
+        // The result is intentionally ignored — Err means already installed, which is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let runtime = {
             let mut guard = self.runtime.lock().unwrap();
             guard.take().ok_or(EngineError::AlreadyRunning)?

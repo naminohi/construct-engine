@@ -42,9 +42,12 @@ SWIFT_DEST="$MESSENGER_ROOT/ConstructMessenger"
 TMP="$ENGINE_ROOT/.build_tmp"
 
 # ── Аргументы ─────────────────────────────────────────────────────────────────
-BUILD_IOS=true
-BUILD_SIM=true
-BUILD_MAC=true
+# Platform flags start false; each --xxx flag ENABLES that platform.
+# If no platform flag is given, all three platforms are built (full dist).
+BUILD_IOS=false
+BUILD_SIM=false
+BUILD_MAC=false
+HAS_PLATFORM_FLAG=false
 BINDINGS_ONLY=false
 DO_CLEAN=false
 PROFILE="release"
@@ -52,18 +55,27 @@ CARGO_FLAGS="--release"
 
 for arg in "$@"; do
   case "$arg" in
-    --ios)      BUILD_SIM=false; BUILD_MAC=false ;;
-    --sim)      BUILD_IOS=false; BUILD_MAC=false ;;
-    --mac)      BUILD_IOS=false; BUILD_SIM=false ;;
+    --ios)      BUILD_IOS=true; HAS_PLATFORM_FLAG=true ;;
+    --sim)      BUILD_SIM=true; HAS_PLATFORM_FLAG=true ;;
+    --mac)      BUILD_MAC=true; HAS_PLATFORM_FLAG=true ;;
     --bindings) BINDINGS_ONLY=true ;;
     --clean)    DO_CLEAN=true ;;
     --debug)    PROFILE="debug"; CARGO_FLAGS="" ;;
     -h|--help)
       echo "Использование: $0 [--ios] [--sim] [--mac] [--bindings] [--clean] [--debug]"
+      echo "  Флаги --ios, --sim, --mac аддитивны: --ios --sim собирает обе платформы."
+      echo "  Без флагов — полная сборка (iOS + Simulator + macOS)."
       exit 0 ;;
     *) warn "Неизвестный аргумент: $arg" ;;
   esac
 done
+
+# Default: build all platforms when no platform flag was specified.
+if ! $HAS_PLATFORM_FLAG; then
+  BUILD_IOS=true
+  BUILD_SIM=true
+  BUILD_MAC=true
+fi
 
 # ── Проверка зависимостей ─────────────────────────────────────────────────────
 hdr "Проверка зависимостей"
@@ -141,10 +153,28 @@ build_target() {
     aarch64-apple-ios-sim|x86_64-apple-ios) deploy_env="IPHONEOS_DEPLOYMENT_TARGET=18.0" ;;
     aarch64-apple-darwin)       deploy_env="MACOSX_DEPLOYMENT_TARGET=15.0" ;;
   esac
+
+  local log="$TMP/cargo_${arch//\//_}.log"
+  # Run cargo, tee full output to log, and show filtered lines.
+  # Capture PIPESTATUS[0] (cargo exit) BEFORE || true resets it.
   env $deploy_env cargo build --lib --target "$arch" \
-    --features ios $CARGO_FLAGS 2>&1 \
-    | grep -E "^error|^warning\[|Compiling construct-engine|Finished" || true
-  ok "Собрано: $arch"
+      --features ios $CARGO_FLAGS 2>&1 \
+    | tee "$log" \
+    | grep -E "^error\[|^error:|warning\[|Compiling construct-engine|Finished" \
+    ; local pipe_status=("${PIPESTATUS[@]}") ; true
+
+  # PIPESTATUS[0] = cargo, [1] = tee, [2] = grep.
+  # grep exit 1 (no matches on cached build) is normal — only cargo matters.
+  if [ "${pipe_status[0]}" -ne 0 ]; then
+    warn "cargo build failed (exit ${pipe_status[0]}). Последние строки лога:"
+    tail -20 "$log" || true
+    fail "cargo build завершился с ошибкой для $arch"
+  fi
+
+  # Verify the artifact was actually produced.
+  local artifact="$ENGINE_ROOT/target/$arch/$PROFILE/libconstruct_engine.a"
+  [ -f "$artifact" ] || fail "Артефакт не найден после сборки: $artifact"
+  ok "Собрано: $arch  ($(du -sh "$artifact" | cut -f1))"
 }
 
 # ── Генерация ─────────────────────────────────────────────────────────────────
@@ -158,18 +188,27 @@ fi
 # ── Сборка платформ ───────────────────────────────────────────────────────────
 hdr "Сборка статических библиотек"
 
-$BUILD_IOS && build_target "aarch64-apple-ios"
+if $BUILD_IOS; then
+  build_target "aarch64-apple-ios"
+fi
 
 if $BUILD_SIM; then
   build_target "aarch64-apple-ios-sim"
-  if ! rustup target list --installed 2>/dev/null | grep -q "x86_64-apple-ios"; then
-    info "Добавление x86_64-apple-ios…"
-    rustup target add x86_64-apple-ios
+  # x86_64 sim slice — needed for Intel Mac simulators.
+  # On M-series hosts it is still useful for fat-binary compatibility but
+  # skipped gracefully if the target is not installed and --fast is passed.
+  if rustup target list --installed 2>/dev/null | grep -q "x86_64-apple-ios"; then
+    build_target "x86_64-apple-ios"
+  else
+    info "x86_64-apple-ios не установлен — добавляем…"
+    rustup target add x86_64-apple-ios 2>&1 | tail -3
+    build_target "x86_64-apple-ios"
   fi
-  build_target "x86_64-apple-ios"
 fi
 
-$BUILD_MAC && build_target "aarch64-apple-darwin"
+if $BUILD_MAC; then
+  build_target "aarch64-apple-darwin"
+fi
 
 # ── Merge + copy ──────────────────────────────────────────────────────────────
 hdr "Объединение и копирование"
@@ -188,11 +227,17 @@ if $BUILD_IOS; then
 fi
 
 if $BUILD_SIM; then
-  lipo -create \
-    "$ENGINE_ROOT/target/aarch64-apple-ios-sim/$PROFILE/libconstruct_engine.a" \
-    "$ENGINE_ROOT/target/x86_64-apple-ios/$PROFILE/libconstruct_engine.a" \
-    -output "$TMP/libengine_sim.a"
-  ok "$(du -sh "$TMP/libengine_sim.a" | cut -f1)  ← sim fat (arm64 + x86_64)"
+  # Prefer fat sim binary (arm64 + x86_64) so the xcframework works on both M-series
+  # and Intel Mac simulators.  Fall back to arm64-only if x86_64 wasn't built.
+  arm64_sim="$ENGINE_ROOT/target/aarch64-apple-ios-sim/$PROFILE/libconstruct_engine.a"
+  x86_sim="$ENGINE_ROOT/target/x86_64-apple-ios/$PROFILE/libconstruct_engine.a"
+  if [ -f "$x86_sim" ]; then
+    lipo -create "$arm64_sim" "$x86_sim" -output "$TMP/libengine_sim.a"
+    ok "$(du -sh "$TMP/libengine_sim.a" | cut -f1)  ← sim fat (arm64 + x86_64)"
+  else
+    cp "$arm64_sim" "$TMP/libengine_sim.a"
+    ok "$(du -sh "$TMP/libengine_sim.a" | cut -f1)  ← sim arm64-only"
+  fi
 fi
 
 if $BUILD_MAC; then
@@ -210,9 +255,6 @@ make_headers_dir() {
 
 # ── Сборка xcframework ────────────────────────────────────────────────────────
 hdr "Сборка ConstructEngine.xcframework"
-
-rm -rf "$XCFW_DEST"
-mkdir -p "$XCFW_DEST"
 
 XCODEBUILD_ARGS=()
 
@@ -243,11 +285,18 @@ if $BUILD_MAC; then
                     -headers "$local_dir/Headers")
 fi
 
+# Guard: at least one slice must be present.
+[ "${#XCODEBUILD_ARGS[@]}" -gt 0 ] || fail "Нет slice для xcframework — проверь флаги сборки."
+
+# Replace destination only after slices are ready so a prior successful
+# xcframework is never removed if the new build fails mid-way.
+rm -rf "$XCFW_DEST"
 xcodebuild -create-xcframework \
   "${XCODEBUILD_ARGS[@]}" \
   -output "$XCFW_DEST" 2>&1 | grep -v "^note:" || true
 
-[ -d "$XCFW_DEST" ] || fail "xcodebuild -create-xcframework завершился с ошибкой"
+# Check that Info.plist was written — empty directory passes [ -d ] but is not a valid xcframework.
+[ -f "$XCFW_DEST/Info.plist" ] || fail "xcodebuild -create-xcframework завершился с ошибкой"
 ok "ConstructEngine.xcframework → $XCFW_DEST"
 
 # ── Очистка ───────────────────────────────────────────────────────────────────
