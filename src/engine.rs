@@ -1559,13 +1559,100 @@ impl ConstructEngine {
         })();
 
         let (plaintext, state_bytes) = match result {
-            Ok(v) => v,
+            Ok(v) => {
+                // Success — clear any lingering healing record.
+                (|| {
+                    let guard = self.core.lock().expect("core mutex poisoned");
+                    if let Some(core) = guard.as_ref() {
+                        let mut orc = core.lock().expect("inner core mutex poisoned");
+                        orc.clear_heal_record(&sender_id);
+                    }
+                })();
+                v
+            }
             Err(e) => {
-                error!("session_init_responder: {e}");
-                self.callback.on_action(PlatformAction::SessionError {
-                    contact_id: sender_id,
-                    message: e,
-                });
+                warn!("session_init_responder: X3DH/decrypt failed for {sender_id}: {e}");
+                // ── Healing path ─────────────────────────────────────────────
+                // Enqueue the failed payload and check if a retry is allowed.
+                let decision: construct_core::orchestration::healing_queue::HealingDecision = (|| {
+                    let guard = self.core.lock().expect("core mutex poisoned");
+                    match guard.as_ref() {
+                        None => construct_core::orchestration::healing_queue::HealingDecision::NotFound,
+                        Some(core) => {
+                            let mut orc = core.lock().expect("inner core mutex poisoned");
+                            orc.enqueue_heal(&sender_id, wire_payload.clone());
+                            orc.record_heal_attempt(&sender_id)
+                        }
+                    }
+                })();
+
+                use construct_core::orchestration::healing_queue::HealingDecision;
+                match decision {
+                    HealingDecision::RetryAllowed { attempt, retry_after_ms } => {
+                        warn!(
+                            "session healing: attempt {attempt} for {sender_id}, retry in {retry_after_ms}ms"
+                        );
+                        // Re-encode the original envelope and re-enqueue it via
+                        // frame_tx after the backoff delay. The retry goes through
+                        // the exact same incoming-message pipeline, avoiding any
+                        // spawn-Send constraints on handler methods.
+                        let frame_tx = self.frame_tx.clone();
+                        let sender_id_retry = sender_id.clone();
+                        let wire_payload_retry = wire_payload.clone();
+                        let message_id_retry = message_id.clone();
+                        let conversation_id_retry = conversation_id.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(retry_after_ms),
+                            )
+                            .await;
+                            use crate::proto::core::v1::{Envelope, UserId, envelope::MessageIdType};
+                            use crate::proto::services::v1::{
+                                MessageStreamResponse, message_stream_response,
+                            };
+                            let envelope = Envelope {
+                                sender: Some(UserId {
+                                    user_id: sender_id_retry,
+                                    ..Default::default()
+                                }),
+                                encrypted_payload: wire_payload_retry.into(),
+                                conversation_id: conversation_id_retry,
+                                timestamp,
+                                message_id_type: Some(MessageIdType::MessageId(
+                                    message_id_retry,
+                                )),
+                                ..Default::default()
+                            };
+                            let resp = MessageStreamResponse {
+                                response: Some(
+                                    message_stream_response::Response::Message(envelope),
+                                ),
+                                ..Default::default()
+                            };
+                            let body = resp.encode_to_vec();
+                            let frame =
+                                crate::transport::grpc::encode_grpc_frame(&body);
+                            let _ = frame_tx.send(frame);
+                        });
+                    }
+                    HealingDecision::MaxAttemptsReached | HealingDecision::NotFound => {
+                        // Healing exhausted — clear record and request full re-init.
+                        warn!(
+                            "session healing: max attempts reached for {sender_id} — triggering re-init"
+                        );
+                        (|| {
+                            let guard = self.core.lock().expect("core mutex poisoned");
+                            if let Some(core) = guard.as_ref() {
+                                let mut orc = core.lock().expect("inner core mutex poisoned");
+                                orc.clear_heal_record(&sender_id);
+                            }
+                        })();
+                        self.callback.on_action(PlatformAction::SessionError {
+                            contact_id: sender_id,
+                            message: format!("Healing failed: {e}"),
+                        });
+                    }
+                }
                 return;
             }
         };
@@ -1685,3 +1772,10 @@ impl ConstructEngine {
         }
     }
 }
+
+// Send bound verification — compile-time only
+fn _assert_transport_send(_: &Arc<Transport>) where Arc<Transport>: Send {}
+fn _assert_transport_send2() where Transport: Send {}
+fn _assert_transport_sync2() where Transport: Sync {}
+fn _assert_engine_send2() where ConstructEngine: Send {}
+fn _assert_engine_sync2() where ConstructEngine: Sync {}
