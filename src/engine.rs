@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use prost::Message;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,6 +27,9 @@ pub trait EngineCallback: Send + Sync {
 /// Internal runtime state — held behind a Mutex so `start()` can take it.
 struct EngineRuntime {
     rx: mpsc::Receiver<UiEvent>,
+    /// Incoming gRPC frames from the MessageStream pump task.
+    /// The pump sends raw Bytes here; the event loop receives and routes them.
+    frame_rx: tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
     /// tokio runtime for the engine's async work
     rt: tokio::runtime::Runtime,
 }
@@ -47,6 +51,9 @@ pub struct ConstructEngine {
     /// Current token refresh state: (refresh_token, expires_at_unix_secs).
     /// Written by auth handlers; read by the event loop to schedule auto-refresh.
     token_state: tokio::sync::watch::Sender<Option<TokenRefreshState>>,
+    /// Sender half of the incoming frame channel. Cloned into the stream pump closure
+    /// so frames arrive in the event loop without blocking the pump task.
+    frame_tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
 }
 
 /// Stored so the engine can re-subscribe after a reconnect.
@@ -84,16 +91,18 @@ impl ConstructEngine {
             .map_err(|e| EngineError::internal(format!("tokio runtime: {e}")))?;
 
         let (token_tx, _) = tokio::sync::watch::channel(None::<TokenRefreshState>);
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
 
         Ok(Arc::new(Self {
             config: Arc::new(config),
             callback: Arc::from(callback),
             dispatch_tx: tx,
-            runtime: Mutex::new(Some(EngineRuntime { rx, rt })),
+            runtime: Mutex::new(Some(EngineRuntime { rx, frame_rx, rt })),
             stream: tokio::sync::Mutex::new(None),
             stream_params: tokio::sync::Mutex::new(None),
             core: Mutex::new(core),
             token_state: token_tx,
+            frame_tx,
         }))
     }
 
@@ -106,7 +115,7 @@ impl ConstructEngine {
         };
 
         let engine = Arc::clone(self);
-        let EngineRuntime { rx, rt } = runtime;
+        let EngineRuntime { rx, frame_rx, rt } = runtime;
 
         // Run the event loop on the engine's dedicated tokio runtime.
         // The spawned OS thread owns the runtime and blocks until shutdown.
@@ -115,7 +124,7 @@ impl ConstructEngine {
             .spawn(move || {
                 rt.block_on(async move {
                     info!("construct-engine started");
-                    engine.event_loop(rx).await;
+                    engine.event_loop(rx, frame_rx).await;
                     info!("construct-engine stopped");
                 });
             })
@@ -176,7 +185,11 @@ impl ConstructEngine {
 
     // ── Internal ─────────────────────────────────────────────────────────────
 
-    async fn event_loop(self: Arc<Self>, mut rx: mpsc::Receiver<UiEvent>) {
+    async fn event_loop(
+        self: Arc<Self>,
+        mut rx: mpsc::Receiver<UiEvent>,
+        mut frame_rx: tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
+    ) {
         let transport = match Transport::new(Arc::clone(&self.config)).await {
             Ok(t) => Arc::new(t),
             Err(e) => {
@@ -257,6 +270,11 @@ impl ConstructEngine {
                 event = rx.recv() => {
                     let Some(event) = event else { break };
                     self.handle_event(&transport, event).await;
+                }
+
+                // ── Incoming gRPC frame from MessageStream ───────────────────
+                Some(frame) = frame_rx.recv() => {
+                    Arc::clone(&self).handle_incoming_frame(&transport, frame).await;
                 }
 
                 // ── Token state changed (wake select to recompute timer) ────
@@ -892,17 +910,13 @@ impl ConstructEngine {
             last_cursor: cursor.clone(),
         });
 
-        let cb = Arc::clone(&self.callback);
+        // Clone the sender so the pump closure (which is 'static + Send) can
+        // forward raw gRPC frames into the engine's event loop for async processing.
+        let frame_tx = self.frame_tx.clone();
         let result = transport
             .open_message_stream(conversations, cursor, move |frame| {
-                // Phase 1: forward raw frame bytes to Swift for processing.
-                // Phase 2: decode MessageStreamResponse here and route to OrchestratorCore.
-                cb.on_action(PlatformAction::SaveMessage {
-                    envelope_bytes: frame.to_vec(),
-                    sender_id: String::new(),
-                    conversation_id: String::new(),
-                    timestamp: 0,
-                });
+                // Non-blocking send — the receiver is the event loop select! branch.
+                let _ = frame_tx.send(frame);
             })
             .await;
 
@@ -1210,6 +1224,386 @@ impl ConstructEngine {
         {
             Ok(_) => info!("push token registered"),
             Err(e) => warn!("RegisterDeviceToken failed: {e}"),
+        }
+    }
+
+    // ── Incoming stream frame routing ─────────────────────────────────────────
+
+    /// Decode a raw gRPC frame from the MessageStream pump and dispatch by type.
+    async fn handle_incoming_frame(
+        self: &Arc<Self>,
+        transport: &Arc<Transport>,
+        frame: Bytes,
+    ) {
+        use crate::proto::services::v1::message_stream_response;
+        use crate::transport::grpc::decode_grpc_frame;
+
+        let (msg, _) = match decode_grpc_frame(frame) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("bad gRPC frame from MessageStream: {e}");
+                return;
+            }
+        };
+
+        let resp = match pb::MessageStreamResponse::decode(msg) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("MessageStreamResponse decode failed: {e}");
+                return;
+            }
+        };
+
+        // Persist the latest stream cursor so reconnect resumes without gaps.
+        if let Some(cursor) = resp.stream_cursor {
+            let mut params = self.stream_params.lock().await;
+            if let Some(p) = params.as_mut() {
+                p.last_cursor = Some(cursor);
+            }
+        }
+
+        match resp.response {
+            Some(message_stream_response::Response::Message(envelope)) => {
+                self.handle_incoming_envelope(transport, envelope).await;
+            }
+            Some(message_stream_response::Response::Ack(ack)) => {
+                debug!("stream ack: message_id={:?}", ack.message_id);
+            }
+            Some(message_stream_response::Response::Receipt(receipt)) => {
+                use crate::proto::signaling::v1::delivery_receipt::ReceiptType;
+                if let Some(ReceiptType::Direct(dr)) = receipt.receipt_type {
+                    for id in &dr.message_ids {
+                        self.callback.on_action(PlatformAction::DeliveryReceipt {
+                            message_id: id.clone(),
+                            conversation_id: String::new(),
+                            timestamp: dr.timestamp,
+                        });
+                    }
+                }
+            }
+            Some(message_stream_response::Response::HeartbeatAck(_)) => {
+                debug!("heartbeat ack");
+            }
+            _ => {}
+        }
+    }
+
+    /// Route a decoded `Envelope` from the stream:
+    /// - msgNum == 0  → RESPONDER session init path
+    /// - msgNum > 0   → normal decrypt path
+    async fn handle_incoming_envelope(
+        self: &Arc<Self>,
+        transport: &Arc<Transport>,
+        envelope: crate::proto::core::v1::Envelope,
+    ) {
+        let sender_id = envelope
+            .sender
+            .as_ref()
+            .map(|s| s.user_id.clone())
+            .unwrap_or_default();
+        if sender_id.is_empty() {
+            warn!("incoming envelope: missing sender — dropped");
+            return;
+        }
+
+        let wire_payload = envelope.encrypted_payload.to_vec();
+        if wire_payload.is_empty() {
+            warn!("incoming envelope from {sender_id}: empty payload — dropped");
+            return;
+        }
+
+        let message_id = match &envelope.message_id_type {
+            Some(crate::proto::core::v1::envelope::MessageIdType::MessageId(id)) => id.clone(),
+            _ => uuid::Uuid::new_v4().to_string(),
+        };
+        let conversation_id = envelope.conversation_id.clone();
+        let timestamp = envelope.timestamp;
+
+        // Peek at the Double Ratchet message number without decrypting.
+        let message_number = match construct_core::wire_payload::unpack(&wire_payload) {
+            Ok(d) => d.message_number,
+            Err(e) => {
+                warn!("wire_payload unpack from {sender_id}: {e:?} — dropped");
+                return;
+            }
+        };
+
+        if message_number == 0 {
+            self.handle_session_init_responder(
+                transport,
+                sender_id,
+                wire_payload,
+                message_id,
+                conversation_id,
+                timestamp,
+            )
+            .await;
+        } else {
+            self.handle_decrypt_message(
+                sender_id,
+                wire_payload,
+                message_id,
+                conversation_id,
+                timestamp,
+            )
+            .await;
+        }
+    }
+
+    /// RESPONDER path: msgNum=0 arrived — fetch initiator bundle, run X3DH,
+    /// decrypt the session-init ping, persist state, ACK, fire callbacks.
+    async fn handle_session_init_responder(
+        self: &Arc<Self>,
+        transport: &Arc<Transport>,
+        sender_id: String,
+        wire_payload: Vec<u8>,
+        message_id: String,
+        conversation_id: String,
+        timestamp: i64,
+    ) {
+        use construct_core::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+        use construct_core::crypto::suite_id::SuiteID;
+        use construct_core::orchestration::orchestrator::IncomingFirstMessage;
+
+        info!("session_init_responder: from={sender_id} msg_id={message_id}");
+
+        // ── 1. Fetch sender's (INITIATOR's) public key bundle ────────────────
+        let req = pb::GetPreKeyBundleRequest {
+            user_id: sender_id.clone(),
+            device_id: None,
+            preferred_suite: None,
+        };
+        let resp_bytes = match transport
+            .unary_call(KEY_GET_BUNDLE, &req.encode_to_vec())
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                error!("session_init_responder: GetPreKeyBundle failed: {e}");
+                self.callback.on_action(PlatformAction::SessionError {
+                    contact_id: sender_id,
+                    message: format!("Bundle fetch failed: {e}"),
+                });
+                return;
+            }
+        };
+        let resp = match pb::GetPreKeyBundleResponse::decode(resp_bytes.as_slice()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("session_init_responder: decode error: {e}");
+                self.callback.on_action(PlatformAction::SessionError {
+                    contact_id: sender_id,
+                    message: format!("Bundle decode error: {e}"),
+                });
+                return;
+            }
+        };
+        let bundle = match resp.bundle {
+            Some(b) => b,
+            None => {
+                error!("session_init_responder: no bundle for sender={sender_id}");
+                self.callback.on_action(PlatformAction::SessionError {
+                    contact_id: sender_id,
+                    message: "Server returned no pre-key bundle for sender".to_string(),
+                });
+                return;
+            }
+        };
+
+        // ── 2. Map proto CryptoSuite → SuiteID ──────────────────────────────
+        let suite_id = {
+            use crate::proto::core::v1::CryptoSuite;
+            let cs = bundle.crypto_suite;
+            if cs == CryptoSuite::HybridKyber1024X25519 as i32
+                || cs == CryptoSuite::HybridKyber768X25519 as i32
+            {
+                SuiteID::PQ_HYBRID
+            } else {
+                SuiteID::CLASSIC
+            }
+        };
+
+        // ── 3. Build X3DHPublicKeyBundle from initiator's server bundle ──────
+        let initiator_bundle = X3DHPublicKeyBundle {
+            identity_public: bundle.identity_key.to_vec(),
+            signed_prekey_public: bundle.signed_pre_key.to_vec(),
+            signature: bundle.signed_pre_key_signature.to_vec(),
+            verifying_key: resp.verifying_key.to_vec(),
+            suite_id,
+            one_time_prekey_public: bundle.one_time_pre_key.map(|b| b.to_vec()),
+            one_time_prekey_id: bundle.one_time_pre_key_id,
+            spk_uploaded_at: bundle.spk_uploaded_at as u64,
+            spk_rotation_epoch: bundle.spk_rotation_epoch,
+            kyber_spk_uploaded_at: bundle.kyber_spk_uploaded_at.unwrap_or(0) as u64,
+            kyber_spk_rotation_epoch: bundle.kyber_spk_rotation_epoch.unwrap_or(0),
+        };
+
+        // ── 4. Unpack WirePayload → IncomingFirstMessage ─────────────────────
+        let decoded = match construct_core::wire_payload::unpack(&wire_payload) {
+            Ok(d) => d,
+            Err(e) => {
+                error!("session_init_responder: wire_payload unpack failed: {e:?}");
+                self.callback.on_action(PlatformAction::SessionError {
+                    contact_id: sender_id,
+                    message: format!("WirePayload unpack failed: {e:?}"),
+                });
+                return;
+            }
+        };
+        let first_msg = IncomingFirstMessage {
+            ephemeral_public_key: decoded.dh_public_key,
+            message_number: decoded.message_number,
+            // WirePayload sealed_box = nonce[12] ++ ciphertext
+            content: decoded.sealed_box,
+            one_time_prekey_id: decoded.one_time_prekey_id,
+        };
+
+        // ── 5. X3DH receive + DR init + export state (all sync, single lock) ─
+        let result: Result<(Vec<u8>, Vec<u8>), String> = (|| {
+            let guard = self.core.lock().expect("core mutex poisoned");
+            match guard.as_ref() {
+                None => Err("OrchestratorCore not initialized".to_string()),
+                Some(core) => {
+                    let mut orc = core.lock().expect("inner core mutex poisoned");
+                    let (_session_id, plaintext) = orc
+                        .init_receiving_session_with_msg(
+                            &sender_id,
+                            &initiator_bundle,
+                            &first_msg,
+                        )
+                        .map_err(|e| format!("init_receiving_session: {e}"))?;
+                    let state_bytes = orc
+                        .export_orchestrator_state_cfe()
+                        .unwrap_or_default();
+                    Ok((plaintext, state_bytes))
+                }
+            }
+        })();
+
+        let (plaintext, state_bytes) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                error!("session_init_responder: {e}");
+                self.callback.on_action(PlatformAction::SessionError {
+                    contact_id: sender_id,
+                    message: e,
+                });
+                return;
+            }
+        };
+
+        // ── 6. Persist state (crash-safety before ACK) ───────────────────────
+        if !state_bytes.is_empty() {
+            self.callback.on_action(PlatformAction::SaveKeychain {
+                key: "orchestrator_state".to_string(),
+                data: state_bytes,
+            });
+        }
+
+        // ── 7. ACK the session-init message ──────────────────────────────────
+        self.send_ack_frame(&message_id).await;
+
+        // ── 8. Notify platform ────────────────────────────────────────────────
+        self.callback.on_action(PlatformAction::SessionEstablished {
+            contact_id: sender_id.clone(),
+            session_id: message_id.clone(),
+        });
+
+        // Surface plaintext only if the init ping contained actual content.
+        if !plaintext.is_empty() {
+            self.callback.on_action(PlatformAction::DisplayMessage {
+                plaintext,
+                sender_id: sender_id.clone(),
+                conversation_id,
+                timestamp,
+            });
+        }
+
+        info!("session_init_responder: session established with {}", sender_id);
+    }
+
+    /// Normal decrypt path (msgNum > 0): decrypt WirePayload, ACK, DisplayMessage.
+    async fn handle_decrypt_message(
+        &self,
+        sender_id: String,
+        wire_payload: Vec<u8>,
+        message_id: String,
+        conversation_id: String,
+        timestamp: i64,
+    ) {
+        debug!("decrypt_message: from={sender_id} msg_id={message_id}");
+
+        let result: Result<(Vec<u8>, Vec<u8>), String> = (|| {
+            let guard = self.core.lock().expect("core mutex poisoned");
+            match guard.as_ref() {
+                None => Err("OrchestratorCore not initialized".to_string()),
+                Some(core) => {
+                    let mut orc = core.lock().expect("inner core mutex poisoned");
+                    let plaintext = orc
+                        .decrypt_bytes_for(&sender_id, &wire_payload)
+                        .map_err(|e| format!("decrypt: {e}"))?;
+                    let state_bytes = orc
+                        .export_orchestrator_state_cfe()
+                        .unwrap_or_default();
+                    Ok((plaintext, state_bytes))
+                }
+            }
+        })();
+
+        let (plaintext, state_bytes) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("decrypt_message from {sender_id}: {e}");
+                return;
+            }
+        };
+
+        if !state_bytes.is_empty() {
+            self.callback.on_action(PlatformAction::SaveKeychain {
+                key: "orchestrator_state".to_string(),
+                data: state_bytes,
+            });
+        }
+
+        self.send_ack_frame(&message_id).await;
+
+        self.callback.on_action(PlatformAction::DisplayMessage {
+            plaintext,
+            sender_id,
+            conversation_id,
+            timestamp,
+        });
+    }
+
+    /// Send a delivery ACK for `message_id` over the active MessageStream.
+    async fn send_ack_frame(&self, message_id: &str) {
+        use crate::proto::services::v1::{MessageStreamRequest, message_stream_request};
+        use crate::proto::signaling::v1::{
+            DeliveryReceipt, DirectReceipt, delivery_receipt::ReceiptType,
+        };
+
+        let receipt = DeliveryReceipt {
+            receipt_type: Some(ReceiptType::Direct(DirectReceipt {
+                message_ids: vec![message_id.to_string()],
+                status: 1, // RECEIPT_STATUS_DELIVERED
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                ..Default::default()
+            })),
+        };
+        let req = MessageStreamRequest {
+            request: Some(message_stream_request::Request::Receipt(receipt)),
+            request_id: message_id.to_string(),
+            attempt_id: None,
+        };
+        let frame = crate::transport::grpc::encode_grpc_frame(&req.encode_to_vec());
+        let guard = self.stream.lock().await;
+        if let Some(stream) = guard.as_ref() {
+            if let Err(e) = stream.send_frame(frame).await {
+                warn!("send_ack_frame: stream send failed: {e}");
+            }
         }
     }
 }
