@@ -11,6 +11,15 @@ pub struct EngineConfig {
     /// Set after first successful auth; empty string before first auth.
     pub my_device_id: String,
 
+    /// The authenticated user's logical user ID (hash of identity public key).
+    /// Empty string on fresh installs — set after first registration.
+    pub my_user_id: String,
+
+    /// CFE-encoded private key blob (CfePrivateKeysV1).
+    /// Loaded from Keychain by Swift before creating the engine.
+    /// Empty on fresh installs — set after first registration.
+    pub keys_cfe_data: Vec<u8>,
+
     /// Access token from Keychain — passed at startup if the user was
     /// previously authenticated.  May be None for fresh installs.
     pub auth_token: Option<String>,
@@ -38,6 +47,8 @@ impl Default for EngineConfig {
             server_host: "api.konstruct.cc".to_string(),
             server_port: 443,
             my_device_id: String::new(),
+            my_user_id: String::new(),
+            keys_cfe_data: Vec::new(),
             auth_token: None,
             verify_certs: true,
             use_masque: false,

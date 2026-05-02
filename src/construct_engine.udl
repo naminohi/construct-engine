@@ -36,6 +36,12 @@ interface EngineError {
 dictionary EngineConfig {
     string server_host;
     u16 server_port;
+    /// Device ID (UUID string). Empty on fresh install.
+    string my_device_id;
+    /// User ID (hash of identity public key). Empty on fresh install.
+    string my_user_id;
+    /// CFE-encoded private key blob (CfePrivateKeysV1). Empty on fresh install.
+    bytes keys_cfe_data;
     boolean verify_certs;
     boolean use_masque;
     string? masque_host;

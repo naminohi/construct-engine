@@ -1,5 +1,6 @@
 // Public modules
 pub mod config;
+pub mod core_bridge;
 pub mod engine;
 pub mod error;
 pub mod events;

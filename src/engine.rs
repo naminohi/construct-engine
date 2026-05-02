@@ -6,6 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::EngineConfig,
+    core_bridge::{self, CoreHandle},
     error::EngineError,
     events::{PlatformAction, UiEvent},
     proto::services::v1 as pb,
@@ -40,6 +41,9 @@ pub struct ConstructEngine {
     stream: tokio::sync::Mutex<Option<BiDiStreamHandle>>,
     /// Parameters of the last OpenMessageStream call — used to re-open after reconnect.
     stream_params: tokio::sync::Mutex<Option<StreamParams>>,
+    /// Crypto orchestrator — None on fresh install, set after key registration.
+    /// Always use `core_locked()` accessor; never hold across `.await`.
+    core: Mutex<Option<CoreHandle>>,
 }
 
 /// Stored so the engine can re-subscribe after a reconnect.
@@ -56,6 +60,11 @@ impl ConstructEngine {
     ) -> Result<Arc<Self>, EngineError> {
         let (tx, rx) = mpsc::channel(config.event_buffer);
 
+        // Initialise the crypto orchestrator from the keys blob if available.
+        // On a fresh install keys_cfe_data is empty — core stays None until
+        // the device completes registration and the keys are set.
+        let core = core_bridge::build_core(&config.keys_cfe_data, &config.my_user_id)?;
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("construct-engine")
@@ -70,6 +79,7 @@ impl ConstructEngine {
             runtime: Mutex::new(Some(EngineRuntime { rx, rt })),
             stream: tokio::sync::Mutex::new(None),
             stream_params: tokio::sync::Mutex::new(None),
+            core: Mutex::new(core),
         }))
     }
 
@@ -98,6 +108,29 @@ impl ConstructEngine {
             .map_err(|e| EngineError::internal(format!("thread spawn: {e}")))?;
 
         Ok(())
+    }
+
+    /// Initialise (or replace) the crypto core from a fresh key blob.
+    ///
+    /// Called after device registration completes and the keys are first
+    /// persisted to Keychain. Thread-safe — acquires the core lock.
+    pub fn init_core_from_keys(
+        &self,
+        keys_cfe_data: &[u8],
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        let new_core = core_bridge::build_core(keys_cfe_data, user_id)?;
+        let mut guard = self.core.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = new_core;
+        Ok(())
+    }
+
+    /// Clone the core handle if one is initialised. Returns `None` on fresh install.
+    ///
+    /// The caller receives an `Arc` — they should lock it, do work, and release
+    /// before any `.await` point.
+    pub(crate) fn core(&self) -> Option<CoreHandle> {
+        self.core.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Dispatch a UI event to the engine (sync, non-blocking).
@@ -304,8 +337,17 @@ impl ConstructEngine {
             }
 
             UiEvent::KeychainResult { key, data } => {
-                // Phase 2: deliver to pending keychain future
                 debug!("keychain result: key={key} present={}", data.is_some());
+                // When the keys blob arrives (e.g. after registration), wire up the core.
+                if key == "private_keys" {
+                    if let Some(blob) = data {
+                        let user_id = self.config.my_user_id.clone();
+                        match self.init_core_from_keys(&blob, &user_id) {
+                            Ok(()) => info!("OrchestratorCore (re)initialised from Keychain"),
+                            Err(e) => error!("OrchestratorCore init failed: {e}"),
+                        }
+                    }
+                }
             }
         }
     }
