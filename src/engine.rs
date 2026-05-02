@@ -333,7 +333,12 @@ impl ConstructEngine {
         debug!("handle_event: {event:?}");
         match event {
             UiEvent::PlatformReady => {
-                info!("platform ready — engine fully operational");
+                info!("platform ready — requesting orchestrator state from Keychain");
+                // Request the full orchestrator state (all sessions) from Keychain.
+                // Swift responds with KeychainResult { key: "orchestrator_state", data }.
+                self.callback.on_action(PlatformAction::LoadKeychain {
+                    key: "orchestrator_state".to_string(),
+                });
             }
 
             UiEvent::RegisterDevice {
@@ -436,14 +441,31 @@ impl ConstructEngine {
 
             UiEvent::KeychainResult { key, data } => {
                 debug!("keychain result: key={key} present={}", data.is_some());
-                // When the keys blob arrives (e.g. after registration), wire up the core.
                 if key == "private_keys" {
+                    // Keys blob arrived (after registration or cold start) — initialise the core.
                     if let Some(blob) = data {
                         let user_id = self.config.my_user_id.clone();
                         match self.init_core_from_keys(&blob, &user_id) {
                             Ok(()) => info!("OrchestratorCore (re)initialised from Keychain"),
                             Err(e) => error!("OrchestratorCore init failed: {e}"),
                         }
+                    }
+                } else if key == "orchestrator_state" {
+                    // Session state blob arrived (on startup via PlatformReady).
+                    // Restore all sessions into the already-initialised OrchestratorCore.
+                    if let Some(blob) = data {
+                        let guard = self.core.lock().expect("core mutex poisoned");
+                        if let Some(core) = guard.as_ref() {
+                            let mut orc = core.lock().expect("inner core mutex poisoned");
+                            match orc.import_orchestrator_state_cfe(&blob) {
+                                Ok(()) => info!("orchestrator state restored ({} bytes)", blob.len()),
+                                Err(e) => error!("import_orchestrator_state_cfe failed: {e}"),
+                            }
+                        } else {
+                            warn!("orchestrator_state arrived but OrchestratorCore is not yet initialised — state dropped");
+                        }
+                    } else {
+                        debug!("orchestrator_state: no prior state in Keychain (fresh install)");
                     }
                 }
             }
