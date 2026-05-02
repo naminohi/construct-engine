@@ -26,6 +26,7 @@ interface EngineError {
     AlreadyRunning();
     NotRunning();
     Timeout();
+    Unauthenticated(string message);
     Internal(string message);
 };
 
@@ -42,6 +43,8 @@ dictionary EngineConfig {
     string my_user_id;
     /// CFE-encoded private key blob (CfePrivateKeysV1). Empty on fresh install.
     bytes keys_cfe_data;
+    /// Auth token from Keychain. None on fresh install.
+    string? auth_token;
     boolean verify_certs;
     boolean use_masque;
     string? masque_host;

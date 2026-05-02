@@ -38,7 +38,7 @@ pub struct EngineConfig {
     pub masque_port: Option<u16>,
 
     /// Event channel buffer depth (default: 1024)
-    pub event_buffer: usize,
+    pub event_buffer: u64,
 }
 
 impl Default for EngineConfig {

@@ -75,8 +75,8 @@ impl ConstructEngine {
     pub fn new(
         config: EngineConfig,
         callback: Box<dyn EngineCallback>,
-    ) -> Result<Arc<Self>, EngineError> {
-        let (tx, rx) = mpsc::channel(config.event_buffer);
+    ) -> Result<Self, EngineError> {
+        let (tx, rx) = mpsc::channel(config.event_buffer as usize);
 
         // Initialise the crypto orchestrator from the keys blob if available.
         // On a fresh install keys_cfe_data is empty — core stays None until
@@ -93,7 +93,7 @@ impl ConstructEngine {
         let (token_tx, _) = tokio::sync::watch::channel(None::<TokenRefreshState>);
         let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
 
-        Ok(Arc::new(Self {
+        Ok(Self {
             config: Arc::new(config),
             callback: Arc::from(callback),
             dispatch_tx: tx,
@@ -103,7 +103,7 @@ impl ConstructEngine {
             core: Mutex::new(core),
             token_state: token_tx,
             frame_tx,
-        }))
+        })
     }
 
     /// Start the engine. Non-blocking — spawns background threads.
