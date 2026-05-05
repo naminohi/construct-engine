@@ -79,8 +79,13 @@ impl Transport {
     }
 
     /// Establish (or re-establish) the H3 connection to the server.
+    ///
+    /// Creates a fresh `QuicConnection` on every call so DNS is re-resolved.
+    /// This matters on mobile: when the network interface changes (WiFi → LTE)
+    /// or the server IP rotates, a cached address would loop forever.
     pub async fn connect_h3(&self) -> Result<(), EngineError> {
-        let quic_conn = self.quic.connect().await?;
+        let fresh_quic = QuicConnection::new(Arc::clone(&self.config)).await?;
+        let quic_conn = fresh_quic.connect().await?;
         let h3_quinn_conn = h3_quinn::Connection::new(quic_conn);
 
         let (mut h3_driver, send_request) = h3::client::new(h3_quinn_conn)
