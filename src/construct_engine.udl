@@ -82,6 +82,28 @@ interface ConstructEngine {
 };
 
 // ============================================================================
+// P2P types
+// ============================================================================
+
+enum CandidateType {
+    "LocalLan",
+    "PublicIp",
+    "Relay",
+    "Ipv6LinkLocal",
+    "Ipv6Global"
+};
+
+dictionary ICECandidate {
+    CandidateType candidate_type;
+    string address;
+    u32 priority;
+    string? foundation;
+    string? interface_name;
+    string transport;
+    u32 generation;
+};
+
+// ============================================================================
 // UiEvent — Swift → Rust events
 // ============================================================================
 
@@ -121,6 +143,11 @@ interface UiEvent {
     // Platform responses
     KeychainResult(string key, bytes? data);
     PlatformReady();
+
+    // P2P
+    P2PHandoffInitiate(string peer_id, sequence<ICECandidate> candidates);
+    P2PHandoffAck(string session_id, boolean success, sequence<ICECandidate> candidates, u32? measured_latency_ms);
+    P2PStatusReport(string peer_id, boolean connected, u32? latency_ms, boolean is_relay);
 };
 
 // ============================================================================

@@ -83,7 +83,7 @@ impl Drop for BiDiStreamHandle {
 /// Open the persistent `MessagingService/MessageStream` bidi call.
 ///
 /// * `on_frame` — called for every incoming gRPC frame (raw 5-byte-prefixed bytes)
-///               on the pump task's thread.  Keep it fast (channel forward only).
+///   on the pump task's thread.  Keep it fast (channel forward only).
 pub async fn open_message_stream<F>(
     send_req: &mut H3SendReq,
     service_path: &str,

@@ -2,11 +2,12 @@
 //!
 //! Handles peer discovery, connection establishment, and lifecycle management.
 
-use super::{config::P2PConfig, ice::ICECandidate, P2P_PORT};
+use super::{P2P_PORT, config::P2PConfig, ice::ICECandidate, quic_p2p::P2PConnection, stun};
 use crate::events::UiEvent;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::time::Duration;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
 /// P2P peer information.
@@ -94,6 +95,9 @@ pub struct P2PManager {
     /// Known peers and their status
     peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
 
+    /// Active P2P connections
+    connections: Arc<Mutex<HashMap<String, Arc<P2PConnection>>>>,
+
     /// P2P statistics
     stats: Arc<Mutex<P2PStats>>,
 
@@ -110,6 +114,7 @@ impl P2PManager {
         Self {
             config,
             peers: Arc::new(Mutex::new(HashMap::new())),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(P2PStats::default())),
             local_candidates: Arc::new(Mutex::new(Vec::new())),
             event_tx,
@@ -151,10 +156,7 @@ impl P2PManager {
 
                         debug!("Found LAN candidate: {} ({})", addr, iface.name);
 
-                        let candidate = ICECandidate::lan(
-                            addr,
-                            Some(iface.name.clone()),
-                        );
+                        let candidate = ICECandidate::lan(addr, Some(iface.name.clone()));
 
                         candidates.push(candidate);
                     }
@@ -169,7 +171,10 @@ impl P2PManager {
         for stun_server in &self.config.stun_servers {
             match self.query_stun(stun_server).await {
                 Ok(public_addr) => {
-                    debug!("Found public IP candidate via {}: {}", stun_server, public_addr);
+                    debug!(
+                        "Found public IP candidate via {}: {}",
+                        stun_server, public_addr
+                    );
                     let candidate = ICECandidate::public_ip(public_addr);
                     candidates.push(candidate);
                     break; // Use first successful STUN response
@@ -189,32 +194,38 @@ impl P2PManager {
 
     /// Query STUN server for public IP address.
     async fn query_stun(&self, server: &str) -> Result<String, String> {
-        // Phase 2: Implement actual STUN query using stun-client crate
-        // For now, return placeholder
-        debug!("STUN query to {} (stub - will be implemented in Phase 2)", server);
-        Err("STUN not yet implemented".to_string())
+        match stun::StunClient::new(server) {
+            Ok(client) => client.query(),
+            Err(e) => Err(format!("Failed to create STUN client: {}", e)),
+        }
     }
 
     /// Initiate P2P handoff with a peer.
     ///
     /// Called when server detects both peers online and suggests P2P connection.
     pub async fn initiate_handoff(&self, peer_user_id: &str, peer_device_id: &str) {
-        info!("Initiating P2P handoff with {} ({})", peer_user_id, peer_device_id);
+        info!(
+            "Initiating P2P handoff with {} ({})",
+            peer_user_id, peer_device_id
+        );
 
         let peer_key = format!("{}:{}", peer_user_id, peer_device_id);
 
         // Update peer status
         {
             let mut peers = self.peers.lock().await;
-            peers.entry(peer_key.clone()).and_modify(|peer| {
-                peer.status = PeerStatus::Handshaking;
-            }).or_insert_with(|| PeerInfo {
-                user_id: peer_user_id.to_string(),
-                device_id: peer_device_id.to_string(),
-                candidates: Vec::new(),
-                status: PeerStatus::Handshaking,
-                latency_ms: None,
-            });
+            peers
+                .entry(peer_key.clone())
+                .and_modify(|peer| {
+                    peer.status = PeerStatus::Handshaking;
+                })
+                .or_insert_with(|| PeerInfo {
+                    user_id: peer_user_id.to_string(),
+                    device_id: peer_device_id.to_string(),
+                    candidates: Vec::new(),
+                    status: PeerStatus::Handshaking,
+                    latency_ms: None,
+                });
         }
 
         // Update stats
@@ -257,16 +268,19 @@ impl P2PManager {
         // Store peer's candidates
         {
             let mut peers = self.peers.lock().await;
-            peers.entry(peer_key.clone()).and_modify(|peer| {
-                peer.candidates = candidates.clone();
-                peer.status = PeerStatus::Handshaking;
-            }).or_insert_with(|| PeerInfo {
-                user_id: peer_user_id.to_string(),
-                device_id: peer_device_id.to_string(),
-                candidates,
-                status: PeerStatus::Handshaking,
-                latency_ms: None,
-            });
+            peers
+                .entry(peer_key.clone())
+                .and_modify(|peer| {
+                    peer.candidates = candidates.clone();
+                    peer.status = PeerStatus::Handshaking;
+                })
+                .or_insert_with(|| PeerInfo {
+                    user_id: peer_user_id.to_string(),
+                    device_id: peer_device_id.to_string(),
+                    candidates,
+                    status: PeerStatus::Handshaking,
+                    latency_ms: None,
+                });
         }
 
         // Gather our candidates and send ack
@@ -318,43 +332,118 @@ impl P2PManager {
         {
             let mut peers = self.peers.lock().await;
             if let Some(peer) = peers.get_mut(&peer_key) {
-                peer.status = PeerStatus::Connecting;
+                peer.status = super::PeerStatus::Connecting;
             }
         }
 
         info!("Attempting P2P connection to {}", peer_key);
 
-        // Phase 2: Implement actual QUIC connection logic
-        // For now, simulate connection attempt
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Get peer's candidates
+        let peer_candidates = {
+            let peers = self.peers.lock().await;
+            peers
+                .get(&peer_key)
+                .map(|p| p.candidates.clone())
+                .unwrap_or_default()
+        };
 
-        // Simulate connection failure (will be replaced with real logic)
-        warn!("P2P connection to {} failed (stub - Phase 2)", peer_key);
+        if peer_candidates.is_empty() {
+            warn!("No ICE candidates for {}, cannot connect", peer_key);
+            return;
+        }
 
-        // Update status to failed
-        {
-            let mut peers = self.peers.lock().await;
-            if let Some(peer) = peers.get_mut(&peer_key) {
-                peer.status = PeerStatus::Failed;
+        // Create P2P connection
+        let connection = Arc::new(P2PConnection::new(
+            peer_user_id,
+            peer_device_id,
+            Duration::from_secs(self.config.p2p_timeout_secs),
+        ));
+
+        // Store connection
+        self.connections
+            .lock()
+            .await
+            .insert(peer_key.clone(), connection.clone());
+
+        // Capture strings for async task
+        let peer_key_clone = peer_key.clone();
+        let peer_user_id_owned = peer_user_id.to_string();
+
+        // Attempt connection
+        let conn_clone = connection.clone();
+        let peers_clone = self.peers.clone();
+        let stats_clone = self.stats.clone();
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            match conn_clone.connect(&peer_candidates).await {
+                Ok(()) => {
+                    info!("P2P connection established to {}", peer_key_clone);
+
+                    // Update stats
+                    {
+                        let mut stats = stats_clone.lock().await;
+                        stats.connections_established += 1;
+                        stats.handoffs_successful += 1;
+                    }
+
+                    // Update peer status
+                    {
+                        let mut peers = peers_clone.lock().await;
+                        if let Some(peer) = peers.get_mut(&peer_key_clone) {
+                            peer.status = super::PeerStatus::Connected;
+                        }
+                    }
+
+                    // Measure initial RTT
+                    if let Some(rtt) = conn_clone.measure_rtt().await {
+                        let _ = event_tx.send(UiEvent::P2PStatusReport {
+                            peer_id: peer_user_id_owned.clone(),
+                            connected: true,
+                            latency_ms: Some(rtt as u32),
+                            is_relay: false,
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!("P2P connection to {} failed: {}", peer_key_clone, e);
+
+                    // Update peer status
+                    {
+                        let mut peers = peers_clone.lock().await;
+                        if let Some(peer) = peers.get_mut(&peer_key_clone) {
+                            peer.status = super::PeerStatus::Failed;
+                        }
+                    }
+
+                    // Update stats
+                    {
+                        let mut stats = stats_clone.lock().await;
+                        stats.fallbacks_to_relay += 1;
+                    }
+
+                    // Notify platform
+                    let _ = event_tx.send(UiEvent::P2PStatusReport {
+                        peer_id: peer_user_id_owned,
+                        connected: false,
+                        latency_ms: None,
+                        is_relay: true,
+                    });
+                }
             }
-        }
-
-        // Update stats
-        {
-            let mut stats = self.stats.lock().await;
-            stats.fallbacks_to_relay += 1;
-        }
-
-        // Schedule retry
-        self.schedule_retry(peer_user_id, peer_device_id).await;
+        });
     }
 
     /// Schedule a retry attempt after failure.
+    #[allow(dead_code)]
     async fn schedule_retry(&self, peer_user_id: &str, peer_device_id: &str) {
         let retry_interval = self.config.retry_interval_secs;
         let peer_key = format!("{}:{}", peer_user_id, peer_device_id);
 
-        info!("Scheduling P2P retry for {} in {}s", peer_key, retry_interval);
+        info!(
+            "Scheduling P2P retry for {} in {}s",
+            peer_key, retry_interval
+        );
 
         // Phase 2: Implement actual retry logic with backoff
         debug!("Retry logic stub (will be implemented in Phase 2)");
@@ -408,7 +497,10 @@ impl P2PManager {
 
             // Check if latency is acceptable
             if latency_ms > self.config.max_p2p_latency_ms {
-                warn!("P2P latency too high ({}ms) for {}, considering relay fallback", latency_ms, peer_key);
+                warn!(
+                    "P2P latency too high ({}ms) for {}, considering relay fallback",
+                    latency_ms, peer_key
+                );
             }
         }
 
@@ -416,7 +508,8 @@ impl P2PManager {
         let mut stats = self.stats.lock().await;
         let current_avg = stats.avg_latency_ms.unwrap_or(0.0);
         let count = stats.connections_established.max(1);
-        stats.avg_latency_ms = Some((current_avg * (count - 1) as f64 + latency_ms as f64) / count as f64);
+        stats.avg_latency_ms =
+            Some((current_avg * (count - 1) as f64 + latency_ms as f64) / count as f64);
     }
 
     /// Record bytes sent via P2P.

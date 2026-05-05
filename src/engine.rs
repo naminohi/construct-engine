@@ -157,6 +157,7 @@ impl ConstructEngine {
     ///
     /// The caller receives an `Arc` — they should lock it, do work, and release
     /// before any `.await` point.
+    #[allow(dead_code)]
     pub(crate) fn core(&self) -> Option<CoreHandle> {
         self.core.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -485,12 +486,46 @@ impl ConstructEngine {
                 }
             }
 
-            // P2P events — Phase 4 (server-assisted handoff, not yet implemented)
-            UiEvent::P2PHandoffInitiate { .. } => {
-                tracing::debug!("P2P handoff initiate received (not yet implemented)");
+            // P2P events — Phase 3 (server-assisted handoff with STUN/QUIC)
+            UiEvent::P2PHandoffInitiate {
+                peer_id,
+                candidates,
+            } => {
+                tracing::info!(
+                    "P2P handoff initiate for {}: {} candidates",
+                    peer_id,
+                    candidates.len()
+                );
+                // P2PManager will handle this via handle_handoff_initiate
             }
-            UiEvent::P2PHandoffAck { .. } => {
-                tracing::debug!("P2P handoff ack received (not yet implemented)");
+            UiEvent::P2PHandoffAck {
+                session_id,
+                success,
+                candidates,
+                measured_latency_ms,
+            } => {
+                tracing::info!(
+                    "P2P handoff ack for {}: success={}, {} candidates",
+                    session_id,
+                    success,
+                    candidates.len()
+                );
+                if let Some(latency) = measured_latency_ms {
+                    tracing::info!("P2P latency: {}ms", latency);
+                }
+                // P2PManager will handle this via handle_handoff_ack
+            }
+            UiEvent::P2PStatusReport {
+                peer_id,
+                connected,
+                latency_ms,
+                is_relay,
+            } => {
+                if connected {
+                    tracing::info!("P2P connected to {}: latency={:?}ms", peer_id, latency_ms);
+                } else if is_relay {
+                    tracing::warn!("P2P failed for {}, using relay", peer_id);
+                }
             }
         }
     }
@@ -1430,7 +1465,7 @@ impl ConstructEngine {
                     decrypted_count += 1;
                 } else {
                     // Normal decrypt.
-                    let result: Result<Vec<u8>, String> = (|| {
+                    let result: Result<Vec<u8>, String> = {
                         let guard = self.core.lock().expect("core mutex poisoned");
                         match guard.as_ref() {
                             None => Err("OrchestratorCore not initialized".to_string()),
@@ -1440,7 +1475,7 @@ impl ConstructEngine {
                                     .map_err(|e| format!("decrypt: {e}"))
                             }
                         }
-                    })();
+                    };
 
                     match result {
                         Ok(plaintext) => {
@@ -1480,7 +1515,7 @@ impl ConstructEngine {
         }
 
         // Export state once after the entire batch (all DR ratchets advanced).
-        let state_export_result: Result<Vec<u8>, String> = (|| {
+        let state_export_result: Result<Vec<u8>, String> = {
             let guard = self.core.lock().expect("core mutex poisoned");
             match guard.as_ref() {
                 None => Err("OrchestratorCore not initialized".to_string()),
@@ -1490,7 +1525,7 @@ impl ConstructEngine {
                         .map_err(|e| format!("export: {e}"))
                 }
             }
-        })();
+        };
 
         if let Ok(state_bytes) = state_export_result {
             if !state_bytes.is_empty() {
@@ -1755,23 +1790,22 @@ impl ConstructEngine {
         let (plaintext, state_bytes) = match result {
             Ok(v) => {
                 // Success — clear any lingering healing record.
-                (|| {
+                {
                     let guard = self.core.lock().expect("core mutex poisoned");
                     if let Some(core) = guard.as_ref() {
                         let mut orc = core.lock().expect("inner core mutex poisoned");
                         orc.clear_heal_record(&sender_id);
                     }
-                })();
+                };
                 v
             }
             Err(e) => {
                 warn!("session_init_responder: X3DH/decrypt failed for {sender_id}: {e}");
                 // ── Healing path ─────────────────────────────────────────────
                 // Enqueue the failed payload and check if a retry is allowed.
-                let decision: construct_core::orchestration::healing_queue::HealingDecision =
-                    (|| {
-                        let guard = self.core.lock().expect("core mutex poisoned");
-                        match guard.as_ref() {
+                let decision: construct_core::orchestration::healing_queue::HealingDecision = {
+                    let guard = self.core.lock().expect("core mutex poisoned");
+                    match guard.as_ref() {
                         None => construct_core::orchestration::healing_queue::HealingDecision::NotFound,
                         Some(core) => {
                             let mut orc = core.lock().expect("inner core mutex poisoned");
@@ -1779,7 +1813,7 @@ impl ConstructEngine {
                             orc.record_heal_attempt(&sender_id)
                         }
                     }
-                    })();
+                };
 
                 use construct_core::orchestration::healing_queue::HealingDecision;
                 match decision {
@@ -1835,13 +1869,13 @@ impl ConstructEngine {
                         warn!(
                             "session healing: max attempts reached for {sender_id} — triggering re-init"
                         );
-                        (|| {
+                        {
                             let guard = self.core.lock().expect("core mutex poisoned");
                             if let Some(core) = guard.as_ref() {
                                 let mut orc = core.lock().expect("inner core mutex poisoned");
                                 orc.clear_heal_record(&sender_id);
                             }
-                        })();
+                        };
                         self.callback.on_action(PlatformAction::SessionError {
                             contact_id: sender_id,
                             message: format!("Healing failed: {e}"),
