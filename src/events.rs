@@ -125,6 +125,27 @@ pub enum UiEvent {
     /// Swift signals that all platform services are initialised and
     /// the engine may begin network activity.
     PlatformReady,
+
+    // ── P2P ───────────────────────────────────────────────────────────────────
+    /// Initiate P2P handoff to a peer (client → server signaling).
+    P2PHandoffInitiate {
+        /// Peer's user ID
+        peer_id: String,
+        /// Our ICE candidates
+        candidates: Vec<crate::p2p::ICECandidate>,
+    },
+
+    /// Acknowledge P2P handoff request (client → server).
+    P2PHandoffAck {
+        /// Session ID from handoff request
+        session_id: String,
+        /// Handoff succeeded
+        success: bool,
+        /// Our ICE candidates for the peer
+        candidates: Vec<crate::p2p::ICECandidate>,
+        /// Measured P2P latency (if success)
+        measured_latency_ms: Option<u32>,
+    },
 }
 
 /// Actions the engine requests from the Swift platform layer.

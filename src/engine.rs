@@ -469,16 +469,28 @@ impl ConstructEngine {
                         if let Some(core) = guard.as_ref() {
                             let mut orc = core.lock().expect("inner core mutex poisoned");
                             match orc.import_orchestrator_state_cfe(&blob) {
-                                Ok(()) => info!("orchestrator state restored ({} bytes)", blob.len()),
+                                Ok(()) => {
+                                    info!("orchestrator state restored ({} bytes)", blob.len())
+                                }
                                 Err(e) => error!("import_orchestrator_state_cfe failed: {e}"),
                             }
                         } else {
-                            warn!("orchestrator_state arrived but OrchestratorCore is not yet initialised — state dropped");
+                            warn!(
+                                "orchestrator_state arrived but OrchestratorCore is not yet initialised — state dropped"
+                            );
                         }
                     } else {
                         debug!("orchestrator_state: no prior state in Keychain (fresh install)");
                     }
                 }
+            }
+
+            // P2P events — Phase 4 (server-assisted handoff, not yet implemented)
+            UiEvent::P2PHandoffInitiate { .. } => {
+                tracing::debug!("P2P handoff initiate received (not yet implemented)");
+            }
+            UiEvent::P2PHandoffAck { .. } => {
+                tracing::debug!("P2P handoff ack received (not yet implemented)");
             }
         }
     }
@@ -997,9 +1009,7 @@ impl ConstructEngine {
                     let wire_payload = orc
                         .encrypt_bytes_for(&contact_id, &plaintext)
                         .map_err(|e| format!("encrypt: {e}"))?;
-                    let state_bytes = orc
-                        .export_orchestrator_state_cfe()
-                        .unwrap_or_default();
+                    let state_bytes = orc.export_orchestrator_state_cfe().unwrap_or_default();
                     Ok((wire_payload, state_bytes))
                 }
             }
@@ -1009,10 +1019,11 @@ impl ConstructEngine {
             Ok(v) => v,
             Err(e) => {
                 warn!("send_message encrypt failed: {e}");
-                self.callback.on_action(PlatformAction::UpdateMessageStatus {
-                    local_id,
-                    status: 4, // FAILED
-                });
+                self.callback
+                    .on_action(PlatformAction::UpdateMessageStatus {
+                        local_id,
+                        status: 4, // FAILED
+                    });
                 return;
             }
         };
@@ -1047,23 +1058,26 @@ impl ConstructEngine {
             if let Err(e) = stream.send_frame(frame).await {
                 warn!("send_message enqueue failed: {e}");
                 drop(guard);
-                self.callback.on_action(PlatformAction::UpdateMessageStatus {
-                    local_id,
-                    status: 4, // FAILED
-                });
+                self.callback
+                    .on_action(PlatformAction::UpdateMessageStatus {
+                        local_id,
+                        status: 4, // FAILED
+                    });
             } else {
-                self.callback.on_action(PlatformAction::UpdateMessageStatus {
-                    local_id,
-                    status: 1, // SENT
-                });
+                self.callback
+                    .on_action(PlatformAction::UpdateMessageStatus {
+                        local_id,
+                        status: 1, // SENT
+                    });
             }
         } else {
             warn!("send_message: no active stream — message dropped (local_id={local_id})");
             drop(guard);
-            self.callback.on_action(PlatformAction::UpdateMessageStatus {
-                local_id,
-                status: 4, // FAILED
-            });
+            self.callback
+                .on_action(PlatformAction::UpdateMessageStatus {
+                    local_id,
+                    status: 4, // FAILED
+                });
         }
     }
 
@@ -1487,9 +1501,7 @@ impl ConstructEngine {
             }
         }
 
-        info!(
-            "background_push: done — decrypted={decrypted_count} errors={had_errors}"
-        );
+        info!("background_push: done — decrypted={decrypted_count} errors={had_errors}");
         self.callback
             .on_action(PlatformAction::BackgroundFetchComplete {
                 decrypted_count,
@@ -1500,11 +1512,7 @@ impl ConstructEngine {
     // ── Incoming stream frame routing ─────────────────────────────────────────
 
     /// Decode a raw gRPC frame from the MessageStream pump and dispatch by type.
-    async fn handle_incoming_frame(
-        self: &Arc<Self>,
-        transport: &Arc<Transport>,
-        frame: Bytes,
-    ) {
+    async fn handle_incoming_frame(self: &Arc<Self>, transport: &Arc<Transport>, frame: Bytes) {
         use crate::proto::services::v1::message_stream_response;
         use crate::transport::grpc::decode_grpc_frame;
 
@@ -1736,15 +1744,9 @@ impl ConstructEngine {
                 Some(core) => {
                     let mut orc = core.lock().expect("inner core mutex poisoned");
                     let (_session_id, plaintext) = orc
-                        .init_receiving_session_with_msg(
-                            &sender_id,
-                            &initiator_bundle,
-                            &first_msg,
-                        )
+                        .init_receiving_session_with_msg(&sender_id, &initiator_bundle, &first_msg)
                         .map_err(|e| format!("init_receiving_session: {e}"))?;
-                    let state_bytes = orc
-                        .export_orchestrator_state_cfe()
-                        .unwrap_or_default();
+                    let state_bytes = orc.export_orchestrator_state_cfe().unwrap_or_default();
                     Ok((plaintext, state_bytes))
                 }
             }
@@ -1766,9 +1768,10 @@ impl ConstructEngine {
                 warn!("session_init_responder: X3DH/decrypt failed for {sender_id}: {e}");
                 // ── Healing path ─────────────────────────────────────────────
                 // Enqueue the failed payload and check if a retry is allowed.
-                let decision: construct_core::orchestration::healing_queue::HealingDecision = (|| {
-                    let guard = self.core.lock().expect("core mutex poisoned");
-                    match guard.as_ref() {
+                let decision: construct_core::orchestration::healing_queue::HealingDecision =
+                    (|| {
+                        let guard = self.core.lock().expect("core mutex poisoned");
+                        match guard.as_ref() {
                         None => construct_core::orchestration::healing_queue::HealingDecision::NotFound,
                         Some(core) => {
                             let mut orc = core.lock().expect("inner core mutex poisoned");
@@ -1776,11 +1779,14 @@ impl ConstructEngine {
                             orc.record_heal_attempt(&sender_id)
                         }
                     }
-                })();
+                    })();
 
                 use construct_core::orchestration::healing_queue::HealingDecision;
                 match decision {
-                    HealingDecision::RetryAllowed { attempt, retry_after_ms } => {
+                    HealingDecision::RetryAllowed {
+                        attempt,
+                        retry_after_ms,
+                    } => {
                         warn!(
                             "session healing: attempt {attempt} for {sender_id}, retry in {retry_after_ms}ms"
                         );
@@ -1794,11 +1800,11 @@ impl ConstructEngine {
                         let message_id_retry = message_id.clone();
                         let conversation_id_retry = conversation_id.clone();
                         tokio::spawn(async move {
-                            tokio::time::sleep(
-                                std::time::Duration::from_millis(retry_after_ms),
-                            )
-                            .await;
-                            use crate::proto::core::v1::{Envelope, UserId, envelope::MessageIdType};
+                            tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms))
+                                .await;
+                            use crate::proto::core::v1::{
+                                Envelope, UserId, envelope::MessageIdType,
+                            };
                             use crate::proto::services::v1::{
                                 MessageStreamResponse, message_stream_response,
                             };
@@ -1810,20 +1816,17 @@ impl ConstructEngine {
                                 encrypted_payload: wire_payload_retry.into(),
                                 conversation_id: conversation_id_retry,
                                 timestamp,
-                                message_id_type: Some(MessageIdType::MessageId(
-                                    message_id_retry,
-                                )),
+                                message_id_type: Some(MessageIdType::MessageId(message_id_retry)),
                                 ..Default::default()
                             };
                             let resp = MessageStreamResponse {
-                                response: Some(
-                                    message_stream_response::Response::Message(envelope),
-                                ),
+                                response: Some(message_stream_response::Response::Message(
+                                    envelope,
+                                )),
                                 ..Default::default()
                             };
                             let body = resp.encode_to_vec();
-                            let frame =
-                                crate::transport::grpc::encode_grpc_frame(&body);
+                            let frame = crate::transport::grpc::encode_grpc_frame(&body);
                             let _ = frame_tx.send(frame);
                         });
                     }
@@ -1877,7 +1880,10 @@ impl ConstructEngine {
             });
         }
 
-        info!("session_init_responder: session established with {}", sender_id);
+        info!(
+            "session_init_responder: session established with {}",
+            sender_id
+        );
     }
 
     /// Normal decrypt path (msgNum > 0): decrypt WirePayload, ACK, DisplayMessage.
@@ -1900,9 +1906,7 @@ impl ConstructEngine {
                     let plaintext = orc
                         .decrypt_bytes_for(&sender_id, &wire_payload)
                         .map_err(|e| format!("decrypt: {e}"))?;
-                    let state_bytes = orc
-                        .export_orchestrator_state_cfe()
-                        .unwrap_or_default();
+                    let state_bytes = orc.export_orchestrator_state_cfe().unwrap_or_default();
                     Ok((plaintext, state_bytes))
                 }
             }
@@ -1968,8 +1972,28 @@ impl ConstructEngine {
 }
 
 // Send bound verification — compile-time only
-fn _assert_transport_send(_: &Arc<Transport>) where Arc<Transport>: Send {}
-fn _assert_transport_send2() where Transport: Send {}
-fn _assert_transport_sync2() where Transport: Sync {}
-fn _assert_engine_send2() where ConstructEngine: Send {}
-fn _assert_engine_sync2() where ConstructEngine: Sync {}
+fn _assert_transport_send(_: &Arc<Transport>)
+where
+    Arc<Transport>: Send,
+{
+}
+fn _assert_transport_send2()
+where
+    Transport: Send,
+{
+}
+fn _assert_transport_sync2()
+where
+    Transport: Sync,
+{
+}
+fn _assert_engine_send2()
+where
+    ConstructEngine: Send,
+{
+}
+fn _assert_engine_sync2()
+where
+    ConstructEngine: Sync,
+{
+}

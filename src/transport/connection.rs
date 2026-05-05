@@ -1,10 +1,15 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::{ClientConfig, Endpoint};
 use rustls::RootCertStore;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{config::EngineConfig, error::EngineError};
+
+/// Timeout for a single QUIC handshake attempt.
+/// quinn's internal PTO is ~3 s; we give a modest margin.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// QUIC connection manager.
 ///
@@ -27,8 +32,13 @@ impl QuicConnection {
                 .map_err(|e| EngineError::tls(format!("QuicClientConfig: {e}")))?,
         ));
 
-        // Bind to an ephemeral local port (0.0.0.0:0)
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+        // Prefer dual-stack IPv6 (handles NAT64 on iOS / IPv6-only LANs).
+        // Fall back to IPv4-only if the OS does not support IPv6 sockets.
+        let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())
+            .or_else(|ipv6_err| {
+                warn!("IPv6 bind failed ({ipv6_err}), falling back to IPv4");
+                Endpoint::client("0.0.0.0:0".parse().unwrap())
+            })
             .map_err(|e| EngineError::transport(format!("endpoint bind: {e}")))?;
         endpoint.set_default_client_config(client_config);
 
@@ -51,16 +61,17 @@ impl QuicConnection {
     /// Each call returns a fresh `quinn::Connection` (0-RTT on subsequent calls).
     pub async fn connect(&self) -> Result<quinn::Connection, EngineError> {
         debug!(addr = %self.server_addr, "opening QUIC connection");
-        let conn = self
+        let connect_fut = self
             .endpoint
             .connect(self.server_addr, &self.server_name)
-            .map_err(|e| EngineError::transport(format!("connect: {e}")))?
+            .map_err(|e| EngineError::transport(format!("connect: {e}")))?;
+
+        let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_fut)
             .await
+            .map_err(|_| EngineError::transport("handshake: timed out"))?
             .map_err(|e| EngineError::transport(format!("handshake: {e}")))?;
-        info!(
-            rtt = ?conn.rtt(),
-            "QUIC handshake complete"
-        );
+
+        info!(rtt = ?conn.rtt(), "QUIC handshake complete");
         Ok(conn)
     }
 }
