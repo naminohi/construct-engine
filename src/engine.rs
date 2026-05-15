@@ -464,21 +464,40 @@ impl ConstructEngine {
                     }
                 } else if key == "orchestrator_state" {
                     // Session state blob arrived (on startup via PlatformReady).
-                    // Restore all sessions into the already-initialised OrchestratorCore.
+                    // Restore all sessions into the already-initialised OrchestratorCore,
+                    // then fire SessionEstablished for each contact so the Swift layer
+                    // can populate its session-state cache without re-initialising live sessions.
                     if let Some(blob) = data {
-                        let guard = self.core.lock().expect("core mutex poisoned");
-                        if let Some(core) = guard.as_ref() {
-                            let mut orc = core.lock().expect("inner core mutex poisoned");
-                            match orc.import_orchestrator_state_cfe(&blob) {
-                                Ok(()) => {
-                                    info!("orchestrator state restored ({} bytes)", blob.len())
+                        let restored: Vec<String> = {
+                            let guard = self.core.lock().expect("core mutex poisoned");
+                            if let Some(core) = guard.as_ref() {
+                                let mut orc = core.lock().expect("inner core mutex poisoned");
+                                match orc.import_orchestrator_state_cfe(&blob) {
+                                    Ok(()) => {
+                                        info!(
+                                            "orchestrator state restored ({} bytes), {} session(s)",
+                                            blob.len(),
+                                            orc.get_all_session_contact_ids().len()
+                                        );
+                                        orc.get_all_session_contact_ids()
+                                    }
+                                    Err(e) => {
+                                        error!("import_orchestrator_state_cfe failed: {e}");
+                                        vec![]
+                                    }
                                 }
-                                Err(e) => error!("import_orchestrator_state_cfe failed: {e}"),
+                            } else {
+                                warn!(
+                                    "orchestrator_state arrived but OrchestratorCore is not yet initialised — state dropped"
+                                );
+                                vec![]
                             }
-                        } else {
-                            warn!(
-                                "orchestrator_state arrived but OrchestratorCore is not yet initialised — state dropped"
-                            );
+                        }; // core lock released before firing callbacks
+                        for contact_id in restored {
+                            self.callback.on_action(PlatformAction::SessionEstablished {
+                                contact_id,
+                                session_id: String::new(),
+                            });
                         }
                     } else {
                         debug!("orchestrator_state: no prior state in Keychain (fresh install)");
@@ -680,16 +699,35 @@ impl ConstructEngine {
         transport: &Arc<Transport>,
         device_id: String,
         challenge_response: Vec<u8>,
-        _signing_key: Vec<u8>,
+        signing_key: Vec<u8>,
     ) {
+        use ed25519_dalek::{Signer, SigningKey as Ed25519SigningKey};
+
         info!("authenticate: device_id={device_id}");
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Sign device_id + timestamp using the provided key; fall back to pre-computed signature.
+        let signature: Vec<u8> = if signing_key.len() >= 32 {
+            match <[u8; 32]>::try_from(&signing_key[..32]) {
+                Ok(seed) => {
+                    let sk = Ed25519SigningKey::from_bytes(&seed);
+                    let msg = format!("{device_id}{timestamp}");
+                    sk.sign(msg.as_bytes()).to_bytes().to_vec()
+                }
+                Err(_) => challenge_response,
+            }
+        } else {
+            challenge_response
+        };
+
         let req = pb::AuthenticateDeviceRequest {
             device_id: device_id.clone(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            signature: challenge_response.into(),
+            timestamp,
+            signature: signature.into(),
         };
         match transport
             .unary_call(AUTH_AUTHENTICATE, &req.encode_to_vec())
@@ -1334,12 +1372,29 @@ impl ConstructEngine {
         };
         match transport.unary_call(USER_FIND, &req.encode_to_vec()).await {
             Ok(bytes) => match FindUserResponse::decode(bytes.as_slice()) {
-                Ok(resp) => {
+                Ok(resp) if !resp.user_id.is_empty() => {
                     info!("FindUser: user_id='{}' for query='{query}'", resp.user_id);
+                    self.callback.on_action(PlatformAction::UserFound {
+                        user_id: resp.user_id,
+                        username: query,
+                    });
                 }
-                Err(e) => error!("FindUser decode error: {e}"),
+                Ok(_) => {
+                    warn!("FindUser: not found for query='{query}'");
+                    self.callback
+                        .on_action(PlatformAction::UserNotFound { query });
+                }
+                Err(e) => {
+                    error!("FindUser decode error: {e}");
+                    self.callback
+                        .on_action(PlatformAction::UserNotFound { query });
+                }
             },
-            Err(e) => error!("FindUser failed: {e}"),
+            Err(e) => {
+                error!("FindUser failed: {e}");
+                self.callback
+                    .on_action(PlatformAction::UserNotFound { query });
+            }
         }
     }
 
@@ -1806,7 +1861,9 @@ impl ConstructEngine {
                 let decision: construct_core::orchestration::healing_queue::HealingDecision = {
                     let guard = self.core.lock().expect("core mutex poisoned");
                     match guard.as_ref() {
-                        None => construct_core::orchestration::healing_queue::HealingDecision::NotFound,
+                        None => {
+                            construct_core::orchestration::healing_queue::HealingDecision::NotFound
+                        }
                         Some(core) => {
                             let mut orc = core.lock().expect("inner core mutex poisoned");
                             orc.enqueue_heal(&sender_id, wire_payload.clone());
