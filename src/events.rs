@@ -1,3 +1,18 @@
+/// Anonymity level for outbound messages.
+///
+/// Determines how the engine builds and routes a `SendMessage`.
+///
+/// - `Normal` — standard path: JWT auth on stream, sender identity in `Envelope.sender`.
+/// - `Ghost`  — sealed sender path: `SealedSenderEnvelope` hides sender identity from the server.
+///              `Envelope.sender` is omitted; the encrypted payload is embedded inside `SealedInner`.
+///              X-Send-Token anonymous stream support is planned (requires Privacy Pass wallet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnonymityLevel {
+    #[default]
+    Normal,
+    Ghost,
+}
+
 /// Events dispatched from Swift UI → Rust engine.
 ///
 /// Each variant corresponds to a user or system action. The engine processes
@@ -75,6 +90,10 @@ pub enum UiEvent {
         /// Client-assigned UUID for correlation
         local_id: String,
         conversation_id: String,
+        /// Anonymity level for this message.
+        /// `Ghost` wraps the envelope in `SealedSenderEnvelope` so the server
+        /// cannot see the sender identity from the message content.
+        anonymity_level: AnonymityLevel,
     },
 
     /// Acknowledge delivery of an incoming message.
@@ -145,6 +164,18 @@ pub enum UiEvent {
         candidates: Vec<crate::p2p::ICECandidate>,
         /// Measured P2P latency (if success)
         measured_latency_ms: Option<u32>,
+    },
+
+    /// P2P connection status report.
+    P2PStatusReport {
+        /// Peer's user ID
+        peer_id: String,
+        /// Connected via P2P
+        connected: bool,
+        /// Measured latency (ms)
+        latency_ms: Option<u32>,
+        /// Using relay fallback
+        is_relay: bool,
     },
 }
 
@@ -309,4 +340,23 @@ pub enum PlatformAction {
         /// Whether any errors occurred
         had_errors: bool,
     },
+
+    // ── P2P ───────────────────────────────────────────────────────────────────
+    /// P2P connection status report for UI display.
+    P2PStatusReport {
+        /// Peer's user ID
+        peer_id: String,
+        /// Connected via P2P
+        connected: bool,
+        /// Measured latency (ms)
+        latency_ms: Option<u32>,
+        /// Using relay fallback
+        is_relay: bool,
+    },
+
+    // ── User search ───────────────────────────────────────────────────────────
+    /// A user was found by username query.
+    UserFound { user_id: String, username: String },
+    /// No user found (or not discoverable) for the given query.
+    UserNotFound { query: String },
 }

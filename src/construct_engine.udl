@@ -93,6 +93,21 @@ enum CandidateType {
     "Ipv6Global"
 };
 
+// ============================================================================
+// Anonymity / Ghost mode
+// ============================================================================
+
+/// Controls how the engine routes an outbound message.
+///
+/// - `Normal` — standard authenticated stream with sender identity in the envelope.
+/// - `Ghost`  — sealed-sender envelope: server cannot determine the sender from
+///              message content. JWT connection is still authenticated; full
+///              anonymous transport (anonymous stream) is a future phase.
+enum AnonymityLevel {
+    "Normal",
+    "Ghost"
+};
+
 dictionary ICECandidate {
     CandidateType candidate_type;
     string address;
@@ -124,7 +139,7 @@ interface UiEvent {
     // Messaging
     OpenMessageStream(sequence<string> conversation_ids, string? since_cursor);
     CloseMessageStream();
-    SendMessage(string contact_id, bytes plaintext, string local_id, string conversation_id);
+    SendMessage(string contact_id, bytes plaintext, string local_id, string conversation_id, AnonymityLevel anonymity_level);
     AckMessage(string message_id, u64 message_number);
 
     // Session
@@ -198,4 +213,11 @@ interface PlatformAction {
     // Background push
     ShowNotification(string message_id, string sender_id, string conversation_id, bytes? preview, i64 timestamp);
     BackgroundFetchComplete(u32 decrypted_count, boolean had_errors);
+
+    // P2P
+    P2PStatusReport(string peer_id, boolean connected, u32? latency_ms, boolean is_relay);
+
+    // User search
+    UserFound(string user_id, string username);
+    UserNotFound(string query);
 };

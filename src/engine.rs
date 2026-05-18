@@ -406,6 +406,7 @@ impl ConstructEngine {
                 plaintext,
                 local_id,
                 conversation_id,
+                anonymity_level,
             } => {
                 self.handle_send_message(
                     transport,
@@ -413,6 +414,7 @@ impl ConstructEngine {
                     plaintext,
                     local_id,
                     conversation_id,
+                    anonymity_level,
                 )
                 .await;
             }
@@ -1066,11 +1068,13 @@ impl ConstructEngine {
         plaintext: Vec<u8>,
         local_id: String,
         conversation_id: String,
+        anonymity_level: crate::events::AnonymityLevel,
     ) {
+        use prost::Message as _;
         use crate::proto::core::v1::Envelope;
         use crate::proto::services::v1::{MessageStreamRequest, message_stream_request};
 
-        debug!("send_message: to={contact_id} local_id={local_id}");
+        debug!("send_message: to={contact_id} local_id={local_id} anonymity={anonymity_level:?}");
 
         // ── 1. Encrypt via Double Ratchet + export state ──────────────────────
         let result: Result<(Vec<u8>, Vec<u8>), String> = (|| {
@@ -1109,15 +1113,71 @@ impl ConstructEngine {
             });
         }
 
-        // ── 3. Build Envelope + wrap in MessageStreamRequest ─────────────────
-        let envelope = Envelope {
-            conversation_id: conversation_id.clone(),
-            encrypted_payload: wire_payload.into(),
-            message_id_type: Some(crate::proto::core::v1::envelope::MessageIdType::MessageId(
-                local_id.clone(),
-            )),
-            ..Default::default()
+        // ── 3. Build Envelope ─────────────────────────────────────────────────
+        //
+        // Ghost mode: wrap the DR ciphertext inside a SealedSenderEnvelope so
+        // the server cannot determine the sender from the message content.
+        // The outer Envelope carries no `sender` or `encrypted_payload`; only
+        // `conversation_id` and `sealed_sender` are set.
+        //
+        // Note: the stream is still authenticated with the user's JWT (Phase 1).
+        // Full anonymity (anonymous stream, Privacy Pass tokens) is a future phase.
+        let envelope = match anonymity_level {
+            crate::events::AnonymityLevel::Ghost => {
+                use crate::proto::core::v1::{SealedSenderEnvelope, SealedInner};
+
+                // 32-byte random delivery tag (anti-replay): concatenate two UUIDs.
+                let delivery_tag: Vec<u8> = {
+                    let a = uuid::Uuid::new_v4();
+                    let b = uuid::Uuid::new_v4();
+                    let mut tag = Vec::with_capacity(32);
+                    tag.extend_from_slice(a.as_bytes());
+                    tag.extend_from_slice(b.as_bytes());
+                    tag
+                };
+
+                let sealed_inner = SealedInner {
+                    recipient_user_id: contact_id.clone(),
+                    delivery_tag: delivery_tag.into(),
+                    encrypted_payload: wire_payload.into(),
+                    // content_type 1 = E2EE_SIGNAL (see ContentType in envelope.proto)
+                    content_type: 1,
+                    ..Default::default()
+                };
+
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+
+                let sealed_envelope = SealedSenderEnvelope {
+                    sealed_inner: sealed_inner.encode_to_vec().into(),
+                    timestamp: ts,
+                    ..Default::default()
+                };
+
+                Envelope {
+                    conversation_id: conversation_id.clone(),
+                    sealed_sender: Some(sealed_envelope),
+                    // sender and encrypted_payload intentionally omitted in Ghost mode
+                    message_id_type: Some(
+                        crate::proto::core::v1::envelope::MessageIdType::MessageId(
+                            local_id.clone(),
+                        ),
+                    ),
+                    ..Default::default()
+                }
+            }
+            crate::events::AnonymityLevel::Normal => Envelope {
+                conversation_id: conversation_id.clone(),
+                encrypted_payload: wire_payload.into(),
+                message_id_type: Some(crate::proto::core::v1::envelope::MessageIdType::MessageId(
+                    local_id.clone(),
+                )),
+                ..Default::default()
+            },
         };
+
         let req = MessageStreamRequest {
             request: Some(message_stream_request::Request::Send(envelope)),
             request_id: local_id.clone(),
