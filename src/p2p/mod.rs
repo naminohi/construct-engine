@@ -15,10 +15,14 @@
 pub mod config;
 pub mod ice;
 pub mod manager;
+pub mod quic_p2p;
+pub mod stun;
 
 pub use config::P2PConfig;
 pub use ice::{CandidateType, ICECandidate};
 pub use manager::{P2PManager, PeerInfo, PeerStatus, P2PStats};
+pub use quic_p2p::{ConnectionState, P2PConnection, P2PConnectionBuilder};
+pub use stun::{StunClient, query_stun_servers};
 
 /// P2P connection port (default QUIC port)
 pub const P2P_PORT: u16 = 8765;
