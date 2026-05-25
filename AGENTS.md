@@ -7,15 +7,47 @@ This file provides context for AI agents working in this repository.
 ## What is construct-engine?
 
 `construct-engine` is the **integration layer** between `construct-core` (Rust crypto) and
-non-iOS client applications (TUI, Linux Desktop, Android, future web). It wraps the I/O-free
+non-iOS client applications (Desktop, TUI, Android). It wraps the I/O-free
 `OrchestratorCore` from `construct-core` and adds:
 
 - **Transport**: QUIC/H3 gRPC connection to the Construct server
-- **P2P**: WebRTC/ICE peer-to-peer calls
+- **ICE proxy**: obfs4/WebTunnel DPI evasion (via `construct-ice`)
+- **P2P**: Direct QUIC peer-to-peer connections (STUN/ICE NAT traversal) — Tier 3 of the network model
 - **Message-passing API**: `UiEvent` (client → engine) and `PlatformAction` (engine → client)
 - **UniFFI bindings**: Swift/Kotlin bindings for iOS/Android (feature-gated)
 
 iOS uses `construct-core` directly via UniFFI. All other platforms use `construct-engine`.
+
+---
+
+## Three-Tier Network Model
+
+`construct-engine` implements a tiered connectivity model:
+
+```
+Tier 1 — Federated Servers (gRPC/H3/QUIC)
+   Клиент ↔ construct-server
+   Всегда используется когда сервер достижим
+
+Tier 2 — Community Relay Nodes (ICE/obfs4/WebTunnel)
+   Клиент ↔ construct-relay ↔ construct-server
+   DPI evasion в цензурируемых регионах
+
+Tier 3 — Full P2P (прямой QUIC через STUN/ICE)
+   Клиент ↔ Клиент (сервер не участвует)
+   Минимальная latency для Desktop/TUI/Android
+```
+
+### Target platforms per tier
+
+| Tier | macOS Desktop | TUI | Linux Desktop | Android | iOS |
+|------|:---:|:---:|:---:|:---:|:---:|
+| Tier 1 (gRPC) | ✅ | ✅ | 🔮 | ✅ | ✅ |
+| Tier 2 (ICE) | ✅ | ✅ | 🔮 | 🟡 | ✅ |
+| Tier 3 (P2P QUIC) | ✅ | ✅ | 🔮 | 🟡 | ❌ |
+
+iOS не использует engine для крипто-операций (прямой UniFFI-путь через `ConstructCore.xcframework`).
+P2P на iOS затруднён ограничениями ОС (UDP нестабилен в фоне).
 
 ---
 
@@ -44,7 +76,7 @@ Client app handles result
 | Events | `src/events.rs` | `UiEvent` and `PlatformAction` enums — the full API surface |
 | Core bridge | `src/core_bridge.rs` | Wraps `OrchestratorCore` from `construct-core` |
 | Transport | `src/transport/` | gRPC channel, auth, messaging stream |
-| P2P | `src/p2p/` | P2PManager, ICE candidates, connection state |
+| P2P | `src/p2p/` | P2PManager, ICE candidates, STUN client, QUIC P2P connection |
 | UniFFI | `src/construct_engine.udl` | Binding definitions for Swift/Kotlin |
 
 ### UiEvent → PlatformAction pattern
@@ -104,7 +136,7 @@ These instructions apply to GitHub Copilot, Codex, OpenCode, and similar coding 
 
 ### Shared knowledge base
 
-- Vault: `/Users/maximeliseyev/Code/construct-docs`
+- Vault: `~/Code/construct-docs`
 - `raw/` — source corpus. Do **not** rewrite or reorganize.
 - `wiki/` — canonical curated knowledge base. **Read** from here before architectural work.
 - `wiki/.drafts/` — **reserved for olw**. Never write here manually.
